@@ -33,21 +33,23 @@ class SAUTEDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
-        edus = item['Dialog (EDUs)'][:MAX_EDUS_PER_DIALOG]
+        edus = json.loads(item['Dialog (EDUs)'])[:MAX_EDUS_PER_DIALOG]
         speakers = json.loads(item['Speakers'])[:MAX_EDUS_PER_DIALOG]
 
+        # print(edus)
         tokenized = self.tokenizer(edus, padding="max_length", truncation=True,
                                    max_length=MAX_EDU_LEN, return_tensors="pt")
-        input_ids = tokenized["input_ids"].squeeze(1)
-        attention_mask = tokenized["attention_mask"].squeeze(1)
+        # print(tokenized)
+        input_ids = tokenized["input_ids"]
+        attention_mask = tokenized["attention_mask"]
 
         input_ids, labels = self.mask_tokens(input_ids)
 
         speaker_names = [s if s else "unknown" for s in speakers]
 
         return {
-            "input_ids": input_ids.view(-1),
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
             "speaker_names": speaker_names,
-            "attention_mask": attention_mask.view(-1),
-            "labels": labels.view(-1)
+            "labels": labels
         }

@@ -13,21 +13,17 @@ activation_to_class = {
 
 class FlashTransformerEncoder(nn.Module):
     
-    def __init__(
-        self, 
-        d_model             : int,
-        n_layers            : int,
-        n_heads             : int,
-        dim_feedforward     : int,
-        dropout             : float = 0.1,
-        activation          : str   = "gelu"
-    ):
+    def __init__(self, d_model, n_layers, n_heads, dim_feedforward, dropout=0.1, activation="gelu"):
         super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
         self.layers = nn.ModuleList()
         
         for _ in range(n_layers):
             self.layers.append(
                 nn.ModuleList([
+                    nn.Linear(d_model, 3 * d_model),
                     MHA(embed_dim=d_model, num_heads=n_heads, dropout=dropout),
                     nn.Sequential(
                         nn.Linear(d_model, dim_feedforward),
@@ -41,11 +37,14 @@ class FlashTransformerEncoder(nn.Module):
                 ])
             )
 
-
     def forward(self, x):
+        batch_size, seq_len, _ = x.shape
         
-        for mha, ffn, norm1, norm2 in self.layers:
-            x = norm1(x + mha(x))
+        for qkv_proj, mha, ffn, norm1, norm2 in self.layers:
+            qkv = qkv_proj(x)  # [B, T, 3*D]
+            qkv = qkv.view(batch_size, seq_len, 3, self.n_heads, self.head_dim)
+            out = mha(qkv)  # MHA expects [B, T, 3, H, Dh]
+            x = norm1(x + out)
             x = norm2(x + ffn(x))
             
         return x
@@ -65,7 +64,7 @@ class SpeakerEmbeddingsModule(nn.Module):
     ):
         super().__init__()
         
-        self.bert = BertModel.from_pretrained("bert-base-uncased")
+        self.bert = BertModel.from_pretrained("bert-base-uncased").to("cuda:0")
         
         for param in self.bert.parameters():
             param.requires_grad = False
@@ -99,6 +98,7 @@ class SpeakerEmbeddingsModule(nn.Module):
 
         # Speakers to unique speakers
         inputs  = self.tokenizer(unique_speakers, padding=True, truncation=True, return_tensors="pt")
+        inputs = {k: v.to(self.bert.device) for k, v in inputs.items()}
         outputs = self.bert(**inputs)
         h_0     = outputs.last_hidden_state.mean(dim=1)
         
@@ -173,7 +173,7 @@ class SauteUnit(nn.Module):
             
             unique_names = list(set(speaker_names))
             hidden_state = self.speaker_module.init(
-                speaker_names = unique_names
+                unique_speakers = unique_names
             )
         
         batch, seq_len = input_ids.shape
@@ -182,24 +182,22 @@ class SauteUnit(nn.Module):
         if attention_mask == None:
             attention_mask = (input_ids != 0).int()
             
-        pe_ids = torch.arange(seq_len).broadcast_to(batch, seq_len) * attention_mask
+        pe_ids = torch.arange(seq_len).broadcast_to(batch, seq_len).to("cuda:0") * attention_mask
         embeddings = embeddings + self.token_pe(pe_ids)
         
-        X = torch.empty(batch, seq_len, self.hidden_size)
-        U = torch.empty(batch, self.hidden_size)
-        hidden_state_updates    = torch.empty(batch, self.speaker_embedding_size)
+        X = torch.empty(batch, seq_len, self.hidden_size).to("cuda:0")
+        U = torch.empty(batch, self.hidden_size).to("cuda:0")
+        hidden_state_updates = torch.empty(batch, self.speaker_embedding_size).to("cuda:0")
         
         for i, (speaker, embedding) in enumerate(zip(speaker_names, embeddings)):
             
             s_i = unique_names.index(speaker)
             h_t = self.speaker_module[s_i]
-            
-            # Adding projected h_s_i on the embeddings
-            embedding += h_t
+
             # Applying transformer
-            x = self.edu_encoder(embedding)
-            # Simple Mean Pooling (B, L, D) -> (B, D)
-            u_t = torch.mean(X, dim=1)
+            x = self.edu_encoder(embedding + h_t)
+            # Simple Mean Pooling (L, D) -> (D)
+            u_t = torch.mean(x.unsqueeze(0), dim=1)
             # Updating speaker state
             new_h_t = self.speaker_module.update(u_t, s_i)
             
@@ -231,6 +229,7 @@ class UtteranceEmbedings(PreTrainedModel):
         attention_mask  : torch.Tensor  = None,
         labels          : torch.Tensor  = None
     ):
+        print("Start forward")
 
         X, _ = self.saute_unit.forward(
             input_ids       =   input_ids,
@@ -238,6 +237,8 @@ class UtteranceEmbedings(PreTrainedModel):
             attention_mask  =   attention_mask,
             hidden_state    =   None
         )
+
+        print("Saute Unit finished")
         
         logits = self.lm_head(X)
 
@@ -246,4 +247,5 @@ class UtteranceEmbedings(PreTrainedModel):
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
 
+        print("End forward")
         return MaskedLMOutput(loss=loss, logits=logits)
