@@ -220,7 +220,7 @@ class UtteranceEmbedings(PreTrainedModel):
         self.lm_head    = nn.Linear(config.hidden_size, config.vocab_size)
         self.saute_unit = SauteUnit(config)
         
-        self.config : SAUTEConfig = config.hidden_size
+        self.config : SAUTEConfig = config
         
         self.init_weights()
 

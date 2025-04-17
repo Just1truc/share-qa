@@ -2,6 +2,7 @@ from datasets import load_dataset
 from transformers import BertTokenizerFast
 import torch
 import random
+import json
 
 MAX_EDU_LEN = 128
 MAX_EDUS_PER_DIALOG = 100
@@ -9,7 +10,7 @@ MAX_EDUS_PER_DIALOG = 100
 class SAUTEDataset(torch.utils.data.Dataset):
     def __init__(self, split="train"):
         self.tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
-        self.dataset = load_dataset("JustinDuc/MultiDomain-QADialog", split=split, streaming="True")
+        self.dataset = load_dataset("JustinDuc/MultiDomain-QADialog", split=split)
 
     def __len__(self):
         return len(self.dataset)
@@ -33,7 +34,7 @@ class SAUTEDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         item = self.dataset[idx]
         edus = item['Dialog (EDUs)'][:MAX_EDUS_PER_DIALOG]
-        speakers = item['Speakers'][:MAX_EDUS_PER_DIALOG]
+        speakers = json.loads(item['Speakers'])[:MAX_EDUS_PER_DIALOG]
 
         tokenized = self.tokenizer(edus, padding="max_length", truncation=True,
                                    max_length=MAX_EDU_LEN, return_tensors="pt")
