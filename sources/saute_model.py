@@ -15,15 +15,14 @@ class FlashTransformerEncoder(nn.Module):
     
     def __init__(self, d_model, n_layers, n_heads, dim_feedforward, dropout=0.1, activation="gelu"):
         super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
+        self.n_heads  = n_heads
         self.head_dim = d_model // n_heads
-        self.layers = nn.ModuleList()
+        self.d_model  = self.head_dim * n_heads
+        self.layers   = nn.ModuleList()
         
         for _ in range(n_layers):
             self.layers.append(
                 nn.ModuleList([
-                    nn.Linear(d_model, 3 * d_model),
                     MHA(embed_dim=d_model, num_heads=n_heads, dropout=dropout),
                     nn.Sequential(
                         nn.Linear(d_model, dim_feedforward),
@@ -40,10 +39,8 @@ class FlashTransformerEncoder(nn.Module):
     def forward(self, x):
         batch_size, seq_len, _ = x.shape
         
-        for qkv_proj, mha, ffn, norm1, norm2 in self.layers:
-            qkv = qkv_proj(x)  # [B, T, 3*D]
-            qkv = qkv.view(batch_size, seq_len, 3, self.n_heads, self.head_dim)
-            out = mha(qkv)  # MHA expects [B, T, 3, H, Dh]
+        for mha, ffn, norm1, norm2 in self.layers:
+            out = mha(x)
             x = norm1(x + out)
             x = norm2(x + ffn(x))
             
@@ -128,6 +125,92 @@ class SpeakerEmbeddingsModule(nn.Module):
         return new_h_t
 
 
+class CrossSpeakerEmbeddingsModule(nn.Module):
+    
+    def __init__(
+        self,
+        hidden_size : int,
+        embed_dim   : int,
+        activation  : str = "gelu",
+        dim_update  : int = 2048,
+        dropout     : float = 0.3
+    ):
+        super().__init__()
+        
+        self.bert = BertModel.from_pretrained("bert-base-uncased").to("cuda:0")
+        
+        for param in self.bert.parameters():
+            param.requires_grad = False
+        
+        self.hidden_size    = hidden_size
+        self.embed_dim      = embed_dim
+        self.tokenizer      = BertTokenizerFast.from_pretrained("bert-base-uncased")
+        self.speaker_embeddings = None
+        
+        self.update_gate = nn.Sequential(
+            nn.Linear(
+                in_features     = self.hidden_size + self.embed_dim * 2,
+                out_features    = dim_update
+            ),
+            activation_to_class[activation](),
+            nn.Dropout(dropout),
+            nn.Linear(dim_update, self.hidden_size),
+            nn.Dropout(dropout),
+            nn.LayerNorm(self.hidden_size)
+        )
+        
+        self.linear_projection = nn.Linear(
+            in_features     = hidden_size,
+            out_features    = embed_dim,
+            bias=False
+        )
+
+        self.attention_projection = nn.Linear(
+            in_features     = embed_dim,
+            out_features    = hidden_size,
+            bias=False
+        )
+        
+    
+    def init(self, unique_speakers : list[str]) -> torch.Tensor:
+        # No batching first then batching later if too slow
+
+        # Speakers to unique speakers
+        inputs  = self.tokenizer(unique_speakers, padding=True, truncation=True, return_tensors="pt")
+        inputs = {k: v.to(self.bert.device) for k, v in inputs.items()}
+        outputs = self.bert(**inputs)
+        h_0     = outputs.last_hidden_state.mean(dim=1)
+        
+        # Setup Speaker Embeddings 
+        self.speaker_embeddings = h_0
+        return h_0
+    
+    
+    def __getitem__(self, s_i : int):
+        
+        h_t = self.speaker_embeddings[s_i]
+        return self.linear_projection(h_t)
+
+
+    def update(
+        self,
+        u_t : torch.Tensor,
+        s_i : int
+    ) -> torch.Tensor:
+        
+        h_all = self.speaker_embeddings
+        query = self.attention_projection(u_t)
+        attn_logits = (h_all @ query)
+        attn_weights = torch.softmax(attn_logits, dim=0)
+        context = (attn_weights.unsqueeze(-1) * h_all).sum(dim=0)
+
+        h_s = self.speaker_embeddings[s_i]
+        update_material = torch.cat([u_t, h_s, context], dim=-1)
+        new_h_s = self.update_gate(update_material)
+
+        self.speaker_embeddings[s_i] = h_s + new_h_s
+        return new_h_s
+
 class SauteUnit(nn.Module):
     
     def __init__(self, config : SAUTEConfig):
@@ -142,7 +225,8 @@ class SauteUnit(nn.Module):
             activation      = "gelu"
         )
         
-        self.speaker_module = SpeakerEmbeddingsModule(
+        # self.speaker_module = SpeakerEmbeddingsModule(
+        self.speaker_module = CrossSpeakerEmbeddingsModule(
             hidden_size     = config.speaker_embeddings_size,
             embed_dim       = config.hidden_size,
             activation      = "gelu",
@@ -195,9 +279,13 @@ class SauteUnit(nn.Module):
             h_t = self.speaker_module[s_i]
 
             # Applying transformer
-            x = self.edu_encoder(embedding + h_t)
+            x = self.edu_encoder((embedding + h_t).unsqueeze(0)).squeeze(0)
+            
             # Simple Mean Pooling (L, D) -> (D)
-            u_t = torch.mean(x.unsqueeze(0), dim=1)
+            mask = (input_ids[i] != 0).unsqueeze(-1)
+            sum_x = (x * mask).sum(dim=0)
+            count_x = mask.sum(dim=0).clamp(min=1e-6)
+            u_t = sum_x / count_x
             # Updating speaker state
             new_h_t = self.speaker_module.update(u_t, s_i)
             
@@ -229,7 +317,6 @@ class UtteranceEmbedings(PreTrainedModel):
         attention_mask  : torch.Tensor  = None,
         labels          : torch.Tensor  = None
     ):
-        print("Start forward")
 
         X, _ = self.saute_unit.forward(
             input_ids       =   input_ids,
@@ -237,8 +324,6 @@ class UtteranceEmbedings(PreTrainedModel):
             attention_mask  =   attention_mask,
             hidden_state    =   None
         )
-
-        print("Saute Unit finished")
         
         logits = self.lm_head(X)
 
@@ -247,5 +332,4 @@ class UtteranceEmbedings(PreTrainedModel):
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
 
-        print("End forward")
         return MaskedLMOutput(loss=loss, logits=logits)
