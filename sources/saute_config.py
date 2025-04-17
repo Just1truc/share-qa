@@ -16,18 +16,22 @@ class SAUTEConfig(PretrainedConfig):
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
         num_speaker_embeddings=512,
+        speaker_embeddings_size=768,
         **kwargs
     ):
         super().__init__(**kwargs)
 
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.max_position_embeddings = max_position_embeddings
-        self.max_edus_per_dialog = max_edus_per_dialog
+        self.vocab_size     = vocab_size
+        self.hidden_size    = hidden_size
         self.max_edu_length = max_edu_length
-        self.num_attention_heads = num_attention_heads
-        self.num_hidden_layers = num_hidden_layers
-        self.intermediate_size = intermediate_size
-        self.hidden_dropout_prob = hidden_dropout_prob
+        
+        self.max_edus_per_dialog    = max_edus_per_dialog
+        self.num_attention_heads    = num_attention_heads
+        self.num_hidden_layers      = num_hidden_layers
+        self.intermediate_size      = intermediate_size
+        self.hidden_dropout_prob    = hidden_dropout_prob
+        
+        self.num_speaker_embeddings     = num_speaker_embeddings
+        self.speaker_embeddings_size    = speaker_embeddings_size
+        self.max_position_embeddings    = max_position_embeddings
         self.attention_probs_dropout_prob = attention_probs_dropout_prob
-        self.num_speaker_embeddings = num_speaker_embeddings
