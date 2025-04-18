@@ -208,7 +208,10 @@ class CrossSpeakerEmbeddingsModule(nn.Module):
         update_material = torch.cat([u_t, h_s, context], dim=-1)
         new_h_s = self.update_gate(update_material)
 
-        self.speaker_embeddings[s_i] = h_s + new_h_s
+        new_embeddings = self.speaker_embeddings.clone()
+        new_embeddings[s_i] = h_s + new_h_s
+        self.speaker_embeddings = new_embeddings
+        
         return new_h_s
 
 class SauteUnit(nn.Module):
