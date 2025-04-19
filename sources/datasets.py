@@ -106,7 +106,7 @@ class SAUTEDataset(torch.utils.data.Dataset):
         speakers = (item['speakers'])[:MAX_EDUS_PER_DIALOG]
         # print(list(zip(edus, speakers)))
         if self.dialog_format == "full":
-            edus = ["\n".join(map(lambda x : x[0] + ": " + x[1], zip(speakers, edus)))]
+            edus = ["\n".join(map(lambda x : "[" + x[0] + "]: " + x[1], zip(speakers, edus)))]
 
         # print(edus)
         tokenized = self.tokenizer(edus, padding="max_length", truncation=True,
