@@ -1,5 +1,6 @@
 from datasets import load_dataset
 from transformers import BertTokenizerFast
+from functools import reduce
 import torch
 import random
 import json
@@ -56,14 +57,31 @@ MAX_EDUS_PER_DIALOG = 100
 
 
 class SAUTEDataset(torch.utils.data.Dataset):
-    def __init__(self, split="train"):
+    
+    dialog_formats = [
+        "edu",
+        "full"
+    ]
+    
+    def __init__(
+        self,
+        split         : str = "train",
+        dialog_format : str = "edu"
+    ):
+        assert dialog_format in SAUTEDataset.dialog_formats, f"Unknown dialog format {dialog_format}. Available dialog formats are {str(SAUTEDataset.dialog_formats)}"
+        
         self.tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
         self.dataset = load_dataset("allenai/soda", split=split)
+        
+        self.dialog_format = dialog_format
 
     def __len__(self):
         return len(self.dataset)
 
-    def mask_tokens(self, inputs):
+    def mask_tokens(
+        self,
+        inputs : torch.Tensor
+    ):
         labels = inputs.clone()
         probability_matrix = torch.full(labels.shape, 0.15)
         special_tokens_mask = [
@@ -79,10 +97,15 @@ class SAUTEDataset(torch.utils.data.Dataset):
         inputs[indices_random] = random_words[indices_random]
         return inputs, labels
 
-    def __getitem__(self, idx):
+    def __getitem__(
+        self,
+        idx
+    ):
         item = self.dataset[idx]
         edus = (item['dialogue'])[:MAX_EDUS_PER_DIALOG]
         speakers = (item['speakers'])[:MAX_EDUS_PER_DIALOG]
+        if self.dialog_format == "full":
+            edus = ["\n".join(reduce(lambda x, y : x + y, zip(edus, speakers)))]
 
         # print(edus)
         tokenized = self.tokenizer(edus, padding="max_length", truncation=True,
