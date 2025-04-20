@@ -214,6 +214,209 @@ class CrossSpeakerEmbeddingsModule(nn.Module):
         
         return new_h_s
 
+
+class ZeroInitCrossSpeakerEmbeddings(nn.Module):
+    
+    def __init__(
+        self,
+        hidden_size : int,
+        embed_dim   : int,
+        activation  : str = "gelu",
+        dim_update  : int = 2048,
+        dropout     : float = 0.3
+    ):
+        super().__init__()
+        
+        self.hidden_size    = hidden_size
+        self.embed_dim      = embed_dim
+        self.speaker_embeddings = None
+        
+        self.update_gate = nn.Sequential(
+            nn.Linear(
+                in_features     = self.hidden_size + self.embed_dim * 2,
+                out_features    = dim_update
+            ),
+            activation_to_class[activation](),
+            nn.Dropout(dropout),
+            nn.Linear(dim_update, self.hidden_size),
+            nn.Dropout(dropout),
+            nn.LayerNorm(self.hidden_size)
+        )
+        
+        self.linear_projection = nn.Linear(
+            in_features     = hidden_size,
+            out_features    = embed_dim,
+            bias=False
+        )
+
+        self.attention_projection = nn.Linear(
+            in_features     = embed_dim,
+            out_features    = hidden_size,
+            bias=False
+        )
+        
+    
+    def init(self, unique_speakers : list[str]) -> torch.Tensor:
+        
+        self.speaker_embeddings = torch.zeros(len(unique_speakers), self.hidden_size)
+        return self.speaker_embeddings
+    
+    def __getitem__(self, s_i : int):
+        
+        h_t = self.speaker_embeddings[s_i]
+        return self.linear_projection(h_t)
+
+
+    def update(
+        self,
+        u_t : torch.Tensor,
+        s_i : int
+    ) -> torch.Tensor:
+        
+        h_all = self.speaker_embeddings
+        query = self.attention_projection(u_t)
+        attn_logits = (h_all @ query)
+        attn_weights = torch.softmax(attn_logits, dim=0)
+        context = (attn_weights.unsqueeze(-1) * h_all).sum(dim=0)
+
+        h_s = self.speaker_embeddings[s_i]
+        update_material = torch.cat([u_t, h_s, context], dim=-1)
+        new_h_s = self.update_gate(update_material)
+
+        new_embeddings = self.speaker_embeddings.clone()
+        new_embeddings[s_i] = h_s + new_h_s
+        self.speaker_embeddings = new_embeddings
+        
+        return new_h_s
+
+class FlashTransformer(nn.Module):
+    
+    def __init__(
+        self,
+        d_model     : int,
+        n_heads     : int,
+        dim_feedforward : int,
+        dropout     : float = 0.1,
+        activation  : str = "gelu"
+    ):
+        super().__init__()
+        
+        assert activation in activation_to_class.keys(), f"Unknown activation : [{activation}]"
+        
+        self.n_heads  = n_heads
+        self.head_dim = d_model // n_heads
+        self.d_model  = self.head_dim * n_heads
+        
+        self.mha = MHA(
+            embed_dim   = d_model,
+            num_heads   = n_heads,
+            dropout     = dropout
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            activation_to_class[activation](),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout)
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+    def forward(
+        self,
+        x : torch.Tensor
+    ):
+        out = self.mha(x)
+        x = self.norm1(x + out)
+        x = self.norm2(x + self.mlp(x))
+        
+        return x
+
+class HSauteUnit(nn.Module):
+    
+    # No batch support at First
+    
+    def __init__(
+        self,
+        config : SAUTEConfig
+    ):
+        super().__init__()
+        
+        self.token_embeddings = nn.Embedding(
+            num_embeddings      = config.vocab_size,
+            embedding_dim       = config.hidden_size
+        )
+        self.token_pe           = nn.Embedding(
+            num_embeddings      = config.max_position_embeddings,
+            embedding_dim       = config.hidden_size
+        )
+        
+        self.layers = nn.ModuleList()
+        for _ in range(config.num_hidden_layers):
+            self.layers.append(
+                nn.ModuleList([
+                    FlashTransformer(
+                        d_model         = config.hidden_size,
+                        n_heads         = config.num_attention_heads,
+                        dim_feedforward = config.intermediate_size,
+                        dropout         = config.hidden_dropout_prob,
+                        activation      = "gelu"
+                    ),
+                    ZeroInitCrossSpeakerEmbeddings(
+                        hidden_size     = config.speaker_embeddings_size,
+                        embed_dim       = config.hidden_size,
+                        dropout         = config.hidden_dropout_prob,  
+                        activation      = "gelu"
+                    )
+                ])
+            )
+        
+        self.hidden_size = config.hidden_size
+        self.speaker_embedding_size = config.speaker_embeddings_size
+        
+    def forward(
+        self,
+        input_ids       : torch.Tensor,
+        speaker_names   : list[str],
+        attention_mask  : torch.Tensor | None = None
+    ):
+        batch, seq_len = input_ids.shape
+        
+        unique_names    = list(set(speaker_names))
+        embeddings      = self.token_embeddings(input_ids)
+        
+        if attention_mask == None:
+            attention_mask = (input_ids != 0).int()
+            
+        pe          = self.token_pe(torch.arange(seq_len).broadcast_to(batch, seq_len).to("cuda:0") * attention_mask)
+        embeddings  = embeddings + pe
+        
+        for edu_encoder, speaker_module in self.layers:
+            speaker_module.init(unique_speakers = unique_names)
+            
+            for i, (speaker, embedding) in enumerate(zip(speaker_names, embeddings)):
+
+                s_i = unique_names.index(speaker)
+                h_t = speaker_module[s_i]
+
+                # Applying transformer
+                x = edu_encoder((embedding + h_t).unsqueeze(0)).squeeze(0)
+
+                # Simple Mean Pooling (L, D) -> (D)
+                mask = (input_ids[i] != 0).unsqueeze(-1)
+                sum_x = (x * mask).sum(dim=0)
+                count_x = mask.sum(dim=0).clamp(min=1e-6)
+                u_t = sum_x / count_x
+                
+                # Updating speaker state
+                speaker_module.update(u_t, s_i)
+
+                # Outputs
+                embeddings[i] = x
+        
+        # Contextual embeddings
+        return embeddings, []
+                
 class SauteUnit(nn.Module):
     
     def __init__(self, config : SAUTEConfig):
@@ -307,7 +510,7 @@ class UtteranceEmbedings(PreTrainedModel):
         super().__init__(config)
         
         self.lm_head    = nn.Linear(config.hidden_size, config.vocab_size)
-        self.saute_unit = SauteUnit(config)
+        self.saute_unit = HSauteUnit(config)
         
         self.config : SAUTEConfig = config
         
