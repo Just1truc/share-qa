@@ -258,7 +258,7 @@ class ZeroInitCrossSpeakerEmbeddings(nn.Module):
     
     def init(self, unique_speakers : list[str]) -> torch.Tensor:
         
-        self.speaker_embeddings = torch.zeros(len(unique_speakers), self.hidden_size)
+        self.speaker_embeddings = torch.zeros(len(unique_speakers), self.hidden_size).to("cuda:0")
         return self.speaker_embeddings
     
     def __getitem__(self, s_i : int):
@@ -378,7 +378,8 @@ class HSauteUnit(nn.Module):
         self,
         input_ids       : torch.Tensor,
         speaker_names   : list[str],
-        attention_mask  : torch.Tensor | None = None
+        attention_mask  : torch.Tensor | None = None,
+        hidden_state    : torch.Tensor | None = None
     ):
         batch, seq_len = input_ids.shape
         
@@ -393,6 +394,8 @@ class HSauteUnit(nn.Module):
         
         for edu_encoder, speaker_module in self.layers:
             speaker_module.init(unique_speakers = unique_names)
+
+            X = torch.empty(batch, seq_len, self.hidden_size).to("cuda:0")
             
             for i, (speaker, embedding) in enumerate(zip(speaker_names, embeddings)):
 
@@ -412,7 +415,9 @@ class HSauteUnit(nn.Module):
                 speaker_module.update(u_t, s_i)
 
                 # Outputs
-                embeddings[i] = x
+                X[i] = x
+            
+            embeddings = X
         
         # Contextual embeddings
         return embeddings, []
