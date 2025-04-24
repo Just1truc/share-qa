@@ -542,6 +542,7 @@ class BatchAwareHSauteUnit(nn.Module):
         self.cross_speaker_mha = nn.MultiheadAttention(embed_dim=self.hidden_size, num_heads=4, batch_first=True)
 
     def forward(self, input_ids : torch.Tensor, attention_mask : torch.Tensor, speaker_names : list[str]):
+        # print(input_ids.shape)
         B, T, L = input_ids.size()
         device = input_ids.device
 
@@ -623,7 +624,7 @@ class UtteranceEmbedings(PreTrainedModel):
             input_ids       =   input_ids,
             speaker_names   =   speaker_names,
             attention_mask  =   attention_mask,
-            hidden_state    =   None
+            # hidden_state    =   None
         )
         
         logits = self.lm_head(X)
