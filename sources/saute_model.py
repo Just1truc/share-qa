@@ -598,6 +598,108 @@ class BatchAwareHSauteUnit(nn.Module):
 
         return X, speaker_states[-1]
 
+class VerticalSpeakerMemoryTransformer(nn.Module):
+    def __init__(self, config : SAUTEConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.speaker_embedding_size = config.speaker_embeddings_size
+
+        self.token_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.token_pe = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        self.turn_position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+
+        self.num_layers = config.num_hidden_layers
+        self.encoder_layers = nn.ModuleList([
+            nn.ModuleList([
+                MHA(embed_dim=config.hidden_size, num_heads=config.num_attention_heads, dropout=config.hidden_dropout_prob),
+                nn.Sequential(
+                    nn.Linear(config.hidden_size, config.intermediate_size),
+                    activation_to_class["gelu"](),
+                    nn.Dropout(config.hidden_dropout_prob),
+                    nn.Linear(config.intermediate_size, config.hidden_size),
+                    nn.Dropout(config.hidden_dropout_prob),
+                ),
+                nn.LayerNorm(config.hidden_size),
+                nn.LayerNorm(config.hidden_size),
+                nn.Linear(config.hidden_size * 3, config.hidden_size),  # for token + speaker + context
+                nn.LayerNorm(config.hidden_size),
+                nn.MultiheadAttention(embed_dim=config.hidden_size, num_heads=4, batch_first=True)
+            ]) for _ in range(self.num_layers)
+        ])
+
+        self.tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
+
+    def forward(
+        self,
+        input_ids : torch.Tensor,
+        attention_mask : torch.Tensor,
+        speaker_names : list[str]
+    ):
+        B, T, L = input_ids.size()
+        device = input_ids.device
+
+        flat_speakers = [name for dialog in speaker_names for name in dialog]
+        unique_speakers = list(sorted(set(flat_speakers)))
+        speaker_to_id = {spk: idx for idx, spk in enumerate(unique_speakers)}
+
+        speaker_ids = torch.tensor([[speaker_to_id[name] for name in dialog] for dialog in speaker_names], device=device)
+        num_speakers = len(unique_speakers)
+
+        turn_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
+
+        speaker_states = [torch.zeros(num_speakers, self.hidden_size, device=device) for _ in range(self.num_layers)]
+
+        token_embed = self.token_embeddings(input_ids)
+        pos_ids = torch.arange(L, device=device).unsqueeze(0).unsqueeze(0).expand(B, T, L)
+        token_embed = token_embed + self.token_pe(pos_ids)
+
+        turn_embed = self.turn_position_embeddings(turn_ids)
+        turn_embed = turn_embed.unsqueeze(2).expand(-1, -1, L, -1)
+        X = token_embed + turn_embed
+
+        for l, (mha, ffn, norm1, norm2, speaker_gate, speaker_norm, cross_attn) in enumerate(self.encoder_layers):
+            speaker_memory = speaker_states[l] if l == 0 else speaker_states[l - 1]
+            X_new = torch.zeros_like(X)
+            new_speaker_state = speaker_memory.clone()
+
+            for s_idx in range(num_speakers):
+                speaker_mask = (speaker_ids == s_idx)
+                if not speaker_mask.any():
+                    continue
+
+                speaker_rows = speaker_mask.nonzero(as_tuple=False)
+                reps = []
+                for b, t in speaker_rows:
+                    s_embed = speaker_memory[s_idx].unsqueeze(0).unsqueeze(0)
+                    h = X[b, t] + s_embed
+                    
+                    h_masked = h * attention_mask[b, t].unsqueeze(-1)
+                    
+                    h = mha(h.unsqueeze(0)).squeeze(0)
+                    h = norm1(h + X[b, t])
+                    h = norm2(h + ffn(h))
+                    X_new[b, t] = h
+                    reps.append(h)
+
+                reps_tensor = torch.stack(reps)
+                token_context = reps_tensor.mean(dim=1)
+
+                query = token_context.unsqueeze(1)
+                memory = speaker_memory.unsqueeze(0).expand(token_context.size(0), -1, -1)
+                cross_context, _ = cross_attn(query, memory, memory)
+                cross_context = cross_context.squeeze(1)
+
+                fused = torch.cat([token_context, speaker_memory[s_idx].expand_as(token_context), cross_context], dim=-1)
+                updated = speaker_gate(fused)
+                updated = speaker_norm(updated + speaker_memory[s_idx])
+                new_speaker_state[s_idx] = updated
+
+            speaker_states[l] = new_speaker_state
+            X = X_new
+
+        return X, speaker_states[-1]
+
+
 class UtteranceEmbedings(PreTrainedModel):
     config_class = SAUTEConfig
 
@@ -606,8 +708,9 @@ class UtteranceEmbedings(PreTrainedModel):
         
         self.lm_head    = nn.Linear(config.hidden_size, config.vocab_size)
         # self.saute_unit = HSauteUnit(config)
-        self.saute_unit = BatchAwareHSauteUnit(config)
-        
+        # self.saute_unit = BatchAwareHSauteUnit(config)
+        self.saute_unit = VerticalSpeakerMemoryTransformer(config)
+    
         self.config : SAUTEConfig = config
         
         self.init_weights()

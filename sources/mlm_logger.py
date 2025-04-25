@@ -34,6 +34,11 @@ class WandbPredictionLoggerCallback(TrainerCallback):
 
         table = wandb.Table(columns=["Step", "Masked Input", "Target Word", "Predicted Word"])
 
+        if len(inputs.shape) == 2:
+            inputs["input_ids"] = inputs["input_ids"].unsqueeze(0)
+            inputs["attention_mask"] = inputs["attention_mask"].unsqueeze(0)
+            inputs["labels"] = inputs["labels"].unsqueeze(0)
+
         batch_size, dialog_len, seq_len = preds.shape
 
         for b in range(batch_size):
