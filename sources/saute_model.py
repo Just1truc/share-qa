@@ -598,8 +598,9 @@ class BatchAwareHSauteUnit(nn.Module):
 
         return X, speaker_states[-1]
 
+
 class VerticalSpeakerMemoryTransformer(nn.Module):
-    def __init__(self, config : SAUTEConfig):
+    def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.speaker_embedding_size = config.speaker_embeddings_size
@@ -629,6 +630,149 @@ class VerticalSpeakerMemoryTransformer(nn.Module):
 
         self.tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
+    def forward(self, input_ids, attention_mask, speaker_names):
+        B, T, L = input_ids.size()
+        device = input_ids.device
+
+        turn_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, T)  # (B, T)
+
+        token_embed = self.token_embeddings(input_ids)
+        pos_ids = torch.arange(L, device=device).unsqueeze(0).unsqueeze(0).expand(B, T, L)
+        token_embed = token_embed + self.token_pe(pos_ids)
+
+        turn_embed = self.turn_position_embeddings(turn_ids)  # (B, T, D)
+        turn_embed = turn_embed.unsqueeze(2).expand(-1, -1, L, -1)  # (B, T, L, D)
+        X = token_embed + turn_embed
+
+        speaker_states = [
+            [torch.zeros(len(set(dialog)), self.hidden_size, device=device) for dialog in speaker_names]
+            for _ in range(self.num_layers)
+        ]
+
+        speaker_id_maps = [
+            {spk: idx for idx, spk in enumerate(sorted(set(dialog)))}
+            for dialog in speaker_names
+        ]
+
+        speaker_ids = torch.tensor([
+            [speaker_id_maps[i][name] for name in dialog]
+            for i, dialog in enumerate(speaker_names)
+        ], device=device)
+
+        for l, (mha, ffn, norm1, norm2, speaker_gate, speaker_norm, cross_attn) in enumerate(self.encoder_layers):
+            X_new = torch.zeros_like(X)
+
+            for i in range(B):
+                dialog_speakers = speaker_id_maps[i]
+                dialog_speaker_memory = speaker_states[l][i] if l == 0 else speaker_states[l - 1][i]
+                new_speaker_memory = dialog_speaker_memory.clone()
+
+                for spk, s_idx in dialog_speakers.items():
+                    turn_mask = (speaker_ids[i] == s_idx)
+                    if not turn_mask.any():
+                        continue
+
+                    reps = []
+                    for t in torch.nonzero(turn_mask, as_tuple=False).squeeze(1):
+                        # print(dialog_speaker_memory.shape, s_idx)
+                        # print(dialog_speakers)
+                        s_embed = dialog_speaker_memory[s_idx].unsqueeze(0).unsqueeze(0)  # (1, 1, D)
+                        h = X[i, t] + s_embed  # (L, D)
+
+                        h_masked = h * attention_mask[i, t].unsqueeze(-1)
+
+                        h = mha(h_masked).squeeze(0)
+                        h = norm1(h + X[i, t])
+                        h = norm2(h + ffn(h))
+                        X_new[i, t] = h
+                        reps.append(h)
+
+                    reps_tensor = torch.stack(reps)
+                    token_context = reps_tensor.mean(dim=1)
+
+                    query = token_context.unsqueeze(1)
+                    memory = dialog_speaker_memory.unsqueeze(0).expand(token_context.size(0), -1, -1)
+                    cross_context, _ = cross_attn(query, memory, memory)
+                    cross_context = cross_context.squeeze(1)
+
+                    fused = torch.cat([
+                        token_context,
+                        dialog_speaker_memory[s_idx].unsqueeze(0).expand_as(token_context),
+                        cross_context
+                    ], dim=-1)
+
+                    updated = speaker_gate(fused)
+                    updated = speaker_norm(updated + dialog_speaker_memory[s_idx])
+                    new_speaker_memory[s_idx] = updated.mean(dim=0)
+
+                speaker_states[l][i] = new_speaker_memory
+            X = X_new
+
+        # final_states = torch.stack([torch.stack(dialog_states) for dialog_states in speaker_states[-1]])
+        return X, speaker_states[-1]
+
+
+class SpeakerMemory(nn.Module):
+    def __init__(self, hidden_size : int):
+        super().__init__()
+        self.gate = nn.GRUCell(hidden_size, hidden_size)
+
+    def forward(
+        self,
+        speaker_memory : torch.Tensor,
+        speaker_ids : torch.Tensor,
+        edu_reps : torch.Tensor
+    ):
+        updated_memory = speaker_memory.clone()
+        for idx, sid in enumerate(speaker_ids):
+            updated_memory[sid] = self.gate(edu_reps[idx], speaker_memory[sid])
+        return updated_memory
+
+
+class SpeakerGatedLocalTransformer(nn.Module):
+    
+    def __init__(self, config : SAUTEConfig):
+    
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.vocab_size = config.vocab_size
+
+        self.token_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.token_pe = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        self.speaker_embeddings = nn.Embedding(config.max_speakers, config.hidden_size)
+
+        self.edu_token_encoder = nn.ModuleList([
+            nn.ModuleList([
+                MHA(embed_dim=config.hidden_size, num_heads=config.num_attention_heads, dropout=config.hidden_dropout_prob),
+                nn.Sequential(
+                    nn.Linear(config.hidden_size, config.intermediate_size),
+                    activation_to_class["gelu"](),
+                    nn.Dropout(config.hidden_dropout_prob),
+                    nn.Linear(config.intermediate_size, config.hidden_size),
+                    nn.Dropout(config.hidden_dropout_prob)
+                ),
+                nn.LayerNorm(config.hidden_size),
+                nn.LayerNorm(config.hidden_size)
+            ]) for _ in range(config.num_token_layers)
+        ])
+
+        self.speaker_memory = SpeakerMemory(config.hidden_size)
+
+        self.edu_local_encoder = nn.ModuleList([
+            nn.ModuleList([
+                MHA(embed_dim=config.hidden_size, num_heads=config.num_attention_heads, dropout=config.hidden_dropout_prob),
+                nn.Sequential(
+                    nn.Linear(config.hidden_size, config.intermediate_size),
+                    activation_to_class["gelu"](),
+                    nn.Dropout(config.hidden_dropout_prob),
+                    nn.Linear(config.intermediate_size, config.hidden_size),
+                    nn.Dropout(config.hidden_dropout_prob)
+                ),
+                nn.LayerNorm(config.hidden_size),
+                nn.LayerNorm(config.hidden_size)
+            ]) for _ in range(config.num_edu_layers)
+        ])
+
     def forward(
         self,
         input_ids : torch.Tensor,
@@ -638,66 +782,48 @@ class VerticalSpeakerMemoryTransformer(nn.Module):
         B, T, L = input_ids.size()
         device = input_ids.device
 
-        flat_speakers = [name for dialog in speaker_names for name in dialog]
-        unique_speakers = list(sorted(set(flat_speakers)))
-        speaker_to_id = {spk: idx for idx, spk in enumerate(unique_speakers)}
+        # Infer speaker IDs from names
+        batch_speaker_maps = []
+        speaker_ids = []
+        for dialog in speaker_names:
+            speaker_map = {name: idx for idx, name in enumerate(sorted(set(dialog)))}
+            batch_speaker_maps.append(speaker_map)
+            speaker_ids.append(torch.tensor([speaker_map[name] for name in dialog], device=device))
 
-        speaker_ids = torch.tensor([[speaker_to_id[name] for name in dialog] for dialog in speaker_names], device=device)
-        num_speakers = len(unique_speakers)
+        speaker_ids = torch.stack(speaker_ids)
 
-        turn_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
+        token_embeds = self.token_embeddings(input_ids)
+        position_ids = torch.arange(L, device=device).unsqueeze(0).unsqueeze(0).expand(B, T, L)
+        token_embeds += self.token_pe(position_ids)
 
-        speaker_states = [torch.zeros(num_speakers, self.hidden_size, device=device) for _ in range(self.num_layers)]
+        speaker_embeds = self.speaker_embeddings(speaker_ids).unsqueeze(2).expand(-1, -1, L, -1)
+        token_embeds += speaker_embeds
 
-        token_embed = self.token_embeddings(input_ids)
-        pos_ids = torch.arange(L, device=device).unsqueeze(0).unsqueeze(0).expand(B, T, L)
-        token_embed = token_embed + self.token_pe(pos_ids)
+        token_embeds = token_embeds.view(B*T, L, -1)
+        attention_mask = attention_mask.view(B*T, L)
 
-        turn_embed = self.turn_position_embeddings(turn_ids)
-        turn_embed = turn_embed.unsqueeze(2).expand(-1, -1, L, -1)
-        X = token_embed + turn_embed
+        for mha, ffn, norm1, norm2 in self.edu_token_encoder:
+            x = mha(token_embeds, key_padding_mask=~attention_mask.bool())
+            token_embeds = norm1(token_embeds + x)
+            x = ffn(token_embeds)
+            token_embeds = norm2(token_embeds + x)
 
-        for l, (mha, ffn, norm1, norm2, speaker_gate, speaker_norm, cross_attn) in enumerate(self.encoder_layers):
-            speaker_memory = speaker_states[l] if l == 0 else speaker_states[l - 1]
-            X_new = torch.zeros_like(X)
-            new_speaker_state = speaker_memory.clone()
+        token_embeds = token_embeds.view(B, T, L, -1)
+        edu_reps = (token_embeds * attention_mask.unsqueeze(-1)).sum(dim=2) / attention_mask.sum(dim=2, keepdim=True).clamp(min=1e-6)
 
-            for s_idx in range(num_speakers):
-                speaker_mask = (speaker_ids == s_idx)
-                if not speaker_mask.any():
-                    continue
+        num_speakers = max(len(map) for map in batch_speaker_maps)
+        speaker_memory = torch.zeros(num_speakers, self.hidden_size, device=device)
+        speaker_memory = self.speaker_memory(speaker_memory, speaker_ids.view(-1), edu_reps.view(-1, self.hidden_size))
 
-                speaker_rows = speaker_mask.nonzero(as_tuple=False)
-                reps = []
-                for b, t in speaker_rows:
-                    s_embed = speaker_memory[s_idx].unsqueeze(0).unsqueeze(0)
-                    h = X[b, t] + s_embed
-                    
-                    h_masked = h * attention_mask[b, t].unsqueeze(-1)
-                    
-                    h = mha(h.unsqueeze(0)).squeeze(0)
-                    h = norm1(h + X[b, t])
-                    h = norm2(h + ffn(h))
-                    X_new[b, t] = h
-                    reps.append(h)
+        edu_reps = edu_reps.view(B*T, -1)
+        for mha, ffn, norm1, norm2 in self.edu_local_encoder:
+            x = mha(edu_reps.unsqueeze(0)).squeeze(0)
+            edu_reps = norm1(edu_reps + x)
+            x = ffn(edu_reps)
+            edu_reps = norm2(edu_reps + x)
 
-                reps_tensor = torch.stack(reps)
-                token_context = reps_tensor.mean(dim=1)
-
-                query = token_context.unsqueeze(1)
-                memory = speaker_memory.unsqueeze(0).expand(token_context.size(0), -1, -1)
-                cross_context, _ = cross_attn(query, memory, memory)
-                cross_context = cross_context.squeeze(1)
-
-                fused = torch.cat([token_context, speaker_memory[s_idx].expand_as(token_context), cross_context], dim=-1)
-                updated = speaker_gate(fused)
-                updated = speaker_norm(updated + speaker_memory[s_idx])
-                new_speaker_state[s_idx] = updated
-
-            speaker_states[l] = new_speaker_state
-            X = X_new
-
-        return X, speaker_states[-1]
+        edu_reps = edu_reps.view(B, T, -1)
+        return edu_reps, speaker_memory
 
 
 class UtteranceEmbedings(PreTrainedModel):
@@ -709,8 +835,9 @@ class UtteranceEmbedings(PreTrainedModel):
         self.lm_head    = nn.Linear(config.hidden_size, config.vocab_size)
         # self.saute_unit = HSauteUnit(config)
         # self.saute_unit = BatchAwareHSauteUnit(config)
-        self.saute_unit = VerticalSpeakerMemoryTransformer(config)
-    
+        # self.saute_unit = VerticalSpeakerMemoryTransformer(config)
+        self.saute_unit  = SpeakerGatedLocalTransformer(config)
+
         self.config : SAUTEConfig = config
         
         self.init_weights()
