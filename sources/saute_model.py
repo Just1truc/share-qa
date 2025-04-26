@@ -758,20 +758,20 @@ class SpeakerGatedLocalTransformer(nn.Module):
 
         self.speaker_memory = SpeakerMemory(config.hidden_size)
 
-        self.edu_local_encoder = nn.ModuleList([
-            nn.ModuleList([
-                MHA(embed_dim=config.hidden_size, num_heads=config.num_attention_heads, dropout=config.hidden_dropout_prob),
-                nn.Sequential(
-                    nn.Linear(config.hidden_size, config.intermediate_size),
-                    activation_to_class["gelu"](),
-                    nn.Dropout(config.hidden_dropout_prob),
-                    nn.Linear(config.intermediate_size, config.hidden_size),
-                    nn.Dropout(config.hidden_dropout_prob)
-                ),
-                nn.LayerNorm(config.hidden_size),
-                nn.LayerNorm(config.hidden_size)
-            ]) for _ in range(config.num_edu_layers)
-        ])
+        # self.edu_local_encoder = nn.ModuleList([
+        #     nn.ModuleList([
+        #         MHA(embed_dim=config.hidden_size, num_heads=config.num_attention_heads, dropout=config.hidden_dropout_prob),
+        #         nn.Sequential(
+        #             nn.Linear(config.hidden_size, config.intermediate_size),
+        #             activation_to_class["gelu"](),
+        #             nn.Dropout(config.hidden_dropout_prob),
+        #             nn.Linear(config.intermediate_size, config.hidden_size),
+        #             nn.Dropout(config.hidden_dropout_prob)
+        #         ),
+        #         nn.LayerNorm(config.hidden_size),
+        #         nn.LayerNorm(config.hidden_size)
+        #     ]) for _ in range(config.num_edu_layers)
+        # ])
 
     def forward(
         self,
@@ -809,21 +809,166 @@ class SpeakerGatedLocalTransformer(nn.Module):
             token_embeds = norm2(token_embeds + x)
 
         token_embeds = token_embeds.view(B, T, L, -1)
-        edu_reps = (token_embeds * attention_mask.unsqueeze(-1)).sum(dim=2) / attention_mask.sum(dim=2, keepdim=True).clamp(min=1e-6)
+        attention_mask_exp = attention_mask.view(B, T, L).unsqueeze(-1)
+        edu_reps = (token_embeds * attention_mask_exp).sum(dim=2) / attention_mask_exp.sum(dim=2).clamp(min=1e-6)
 
         num_speakers = max(len(map) for map in batch_speaker_maps)
         speaker_memory = torch.zeros(num_speakers, self.hidden_size, device=device)
         speaker_memory = self.speaker_memory(speaker_memory, speaker_ids.view(-1), edu_reps.view(-1, self.hidden_size))
 
-        edu_reps = edu_reps.view(B*T, -1)
-        for mha, ffn, norm1, norm2 in self.edu_local_encoder:
-            x = mha(edu_reps.unsqueeze(0)).squeeze(0)
-            edu_reps = norm1(edu_reps + x)
-            x = ffn(edu_reps)
-            edu_reps = norm2(edu_reps + x)
+        return token_embeds.view(B, T, L, -1), speaker_memory
 
-        edu_reps = edu_reps.view(B, T, -1)
-        return edu_reps, speaker_memory
+
+class SelectiveMemoryUnit(nn.Module):
+    def __init__(self, hidden_size, retrieval_topk=5):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.retrieval_topk = retrieval_topk
+
+        self.speaker_query = nn.Linear(hidden_size, hidden_size)
+        self.content_query = nn.Linear(hidden_size, hidden_size)
+
+        self.speaker_proj = nn.Linear(hidden_size, hidden_size)
+        self.content_proj = nn.Linear(hidden_size, hidden_size)
+
+        self.memory_updater = nn.GRUCell(hidden_size, hidden_size)
+
+    def forward(self, edu_reps, speaker_ids, batch_speaker_maps):
+        B, T, D = edu_reps.shape
+        device = edu_reps.device
+
+        new_memories = []
+
+        for b in range(B):
+            dialog = edu_reps[b]  # (T, D)
+            speaker_id_dialog = speaker_ids[b]  # (T,)
+            speaker_map = batch_speaker_maps[b]
+            num_speakers = len(speaker_map)
+
+            memory = torch.zeros(num_speakers, D, device=device)
+
+            for t in range(T):
+                current_edu = dialog[t]
+                current_speaker = speaker_id_dialog[t]
+
+                past_edus = dialog[:t] if t > 0 else torch.empty(0, D, device=device)
+                if past_edus.size(0) == 0:
+                    continue
+
+                speaker_scores = (self.speaker_query(current_edu) @ self.speaker_proj(past_edus).transpose(0, 1))
+                content_scores = (self.content_query(current_edu) @ self.content_proj(past_edus).transpose(0, 1))
+
+                total_scores = speaker_scores + content_scores
+
+                topk_vals, topk_idx = torch.topk(total_scores, k=min(self.retrieval_topk, past_edus.size(0)))
+                selected_edus = past_edus[topk_idx]
+
+                retrieved_summary = selected_edus.mean(dim=0)
+
+                memory[current_speaker] = self.memory_updater(retrieved_summary, memory[current_speaker])
+
+            new_memories.append(memory)
+
+        return new_memories
+
+class SelectiveMemoryTransformer(nn.Module):
+    def __init__(self, config : SAUTEConfig):
+        super().__init__()
+
+        self.hidden_size = config.hidden_size
+        self.vocab_size = config.vocab_size
+
+        self.token_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.token_pe = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        self.speaker_embeddings = nn.Embedding(config.max_speakers, config.hidden_size)
+
+        self.initial_encoder = nn.ModuleList([
+            nn.ModuleList([
+                MHA(embed_dim=config.hidden_size, num_heads=config.num_attention_heads, dropout=config.hidden_dropout_prob),
+                nn.Sequential(
+                    nn.Linear(config.hidden_size, config.intermediate_size),
+                    activation_to_class["gelu"](),
+                    nn.Dropout(config.hidden_dropout_prob),
+                    nn.Linear(config.intermediate_size, config.hidden_size),
+                    nn.Dropout(config.hidden_dropout_prob)
+                ),
+                nn.LayerNorm(config.hidden_size),
+                nn.LayerNorm(config.hidden_size)
+            ]) for _ in range(config.num_token_layers)
+        ])
+
+        self.memory_unit = SelectiveMemoryUnit(config.hidden_size, retrieval_topk=5)
+
+        self.final_encoder = nn.ModuleList([
+            nn.ModuleList([
+                MHA(embed_dim=config.hidden_size, num_heads=config.num_attention_heads, dropout=config.hidden_dropout_prob),
+                nn.Sequential(
+                    nn.Linear(config.hidden_size, config.intermediate_size),
+                    activation_to_class["gelu"](),
+                    nn.Dropout(config.hidden_dropout_prob),
+                    nn.Linear(config.intermediate_size, config.hidden_size),
+                    nn.Dropout(config.hidden_dropout_prob)
+                ),
+                nn.LayerNorm(config.hidden_size),
+                nn.LayerNorm(config.hidden_size)
+            ]) for _ in range(config.num_token_layers)
+        ])
+
+    def forward(self, input_ids, attention_mask, speaker_names):
+        B, T, L = input_ids.size()
+        device = input_ids.device
+
+        batch_speaker_maps = []
+        speaker_ids = []
+        for dialog in speaker_names:
+            speaker_map = {name: idx for idx, name in enumerate(sorted(set(dialog)))}
+            batch_speaker_maps.append(speaker_map)
+            speaker_ids.append(torch.tensor([speaker_map[name] for name in dialog], device=device))
+
+        speaker_ids = torch.stack(speaker_ids)
+
+        token_embeds = self.token_embeddings(input_ids)
+        position_ids = torch.arange(L, device=device).unsqueeze(0).unsqueeze(0).expand(B, T, L)
+        token_embeds += self.token_pe(position_ids)
+
+        speaker_embeds = self.speaker_embeddings(speaker_ids).unsqueeze(2).expand(-1, -1, L, -1)
+        token_embeds += speaker_embeds
+
+        token_embeds = token_embeds.view(B*T, L, -1)
+        attention_mask = attention_mask.view(B*T, L)
+
+        for mha, ffn, norm1, norm2 in self.initial_encoder:
+            x = mha(token_embeds, key_padding_mask=~attention_mask.bool())
+            token_embeds = norm1(token_embeds + x)
+            x = ffn(token_embeds)
+            token_embeds = norm2(token_embeds + x)
+
+        token_embeds = token_embeds.view(B, T, L, -1)
+        attention_mask_exp = attention_mask.view(B, T, L).unsqueeze(-1)
+        edu_reps = (token_embeds * attention_mask_exp).sum(dim=2) / attention_mask_exp.sum(dim=2).clamp(min=1e-6)
+
+        speaker_memories = self.memory_unit(edu_reps, speaker_ids, batch_speaker_maps)
+
+        # Inject speaker memory into token embeddings
+        updated_token_embeds = token_embeds.clone()
+        for b in range(B):
+            for t in range(T):
+                speaker_idx = speaker_ids[b, t]
+                memory = speaker_memories[b][speaker_idx]
+                updated_token_embeds[b, t] += memory.unsqueeze(0)
+
+        updated_token_embeds = updated_token_embeds.view(B*T, L, -1)
+
+        for mha, ffn, norm1, norm2 in self.final_encoder:
+            x = mha(updated_token_embeds, key_padding_mask=~attention_mask.bool())
+            updated_token_embeds = norm1(updated_token_embeds + x)
+            x = ffn(updated_token_embeds)
+            updated_token_embeds = norm2(updated_token_embeds + x)
+
+        updated_token_embeds = updated_token_embeds.view(B, T, L, -1)
+
+        return updated_token_embeds, []
+    
 
 
 class UtteranceEmbedings(PreTrainedModel):
@@ -836,7 +981,8 @@ class UtteranceEmbedings(PreTrainedModel):
         # self.saute_unit = HSauteUnit(config)
         # self.saute_unit = BatchAwareHSauteUnit(config)
         # self.saute_unit = VerticalSpeakerMemoryTransformer(config)
-        self.saute_unit  = SpeakerGatedLocalTransformer(config)
+        # self.saute_unit  = SpeakerGatedLocalTransformer(config)
+        self.saute_unit = SelectiveMemoryTransformer(config)
 
         self.config : SAUTEConfig = config
         
@@ -849,13 +995,14 @@ class UtteranceEmbedings(PreTrainedModel):
         attention_mask  : torch.Tensor  = None,
         labels          : torch.Tensor  = None
     ):
-
+        # print(input_ids.shape)
         X, _ = self.saute_unit.forward(
             input_ids       =   input_ids,
             speaker_names   =   speaker_names,
             attention_mask  =   attention_mask,
             # hidden_state    =   None
         )
+        # print(X.shape)
         
         logits = self.lm_head(X)
 
