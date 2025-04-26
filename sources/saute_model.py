@@ -969,7 +969,263 @@ class SelectiveMemoryTransformer(nn.Module):
 
         return updated_token_embeds, []
     
+class SelectiveMemoryLayer2(nn.Module):
+    """A single speaker‑aware transformer layer with sparse memory update."""
+    def __init__(self, hidden_size, intermediate_size, n_heads, dropout=0.1, top_k=5):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.top_k = top_k
 
+        # Standard transformer sub‑modules
+        self.self_attn = MHA(embed_dim=hidden_size, num_heads=n_heads, dropout=dropout)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, intermediate_size),
+            activation_to_class["gelu"](),
+            nn.Dropout(dropout),
+            nn.Linear(intermediate_size, hidden_size),
+            nn.Dropout(dropout)
+        )
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size)
+
+        # Components for sparse retrieval scoring
+        self.speaker_q = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.speaker_k = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.content_q = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.content_k = nn.Linear(hidden_size, hidden_size, bias=False)
+
+        # GRU‑style memory updater
+        self.update_cell = nn.GRUCell(hidden_size, hidden_size)
+
+    def forward(self, tokens, attn_mask, edu_reps, speaker_ids, speaker_memory):
+        """
+        tokens       : (B, T, L, D)
+        attn_mask    : (B, T, L)
+        edu_reps     : (B, T, D)   pooled reps from previous layer
+        speaker_ids  : (B, T)
+        speaker_memory : list[Tensor] len=B, each (S_i, D)
+        """
+        B, T, L, D = tokens.shape
+        device = tokens.device
+
+        # ─── Self‑Attention + FFN ───────────────────────────────────────────
+        tokens_view = tokens.view(B*T, L, D)
+        mask_view   = attn_mask.view(B*T, L)
+        x = self.self_attn(tokens_view, key_padding_mask=~mask_view.bool())
+        tokens_view = self.norm1(tokens_view + x)
+        x = self.ffn(tokens_view)
+        tokens_view = self.norm2(tokens_view + x)
+        tokens = tokens_view.view(B, T, L, D)
+
+        # ─── Sparse Memory Update per dialog ───────────────────────────────
+        new_memories = []
+        for b in range(B):
+            mem  = speaker_memory[b]
+            dialog_reps = edu_reps[b]        # (T, D)
+            spk_ids     = speaker_ids[b]     # (T,)
+            for t in range(T):
+                s_idx = spk_ids[t]
+                if t == 0:
+                    continue  # nothing to compare
+                past = dialog_reps[:t]       # (t, D)
+                # speaker & content scores
+                qs = self.speaker_q(dialog_reps[t])   # (D)
+                ks = self.speaker_k(past)             # (t, D)
+                speaker_score = (qs @ ks.T)           # (t)
+                qc = self.content_q(dialog_reps[t])
+                kc = self.content_k(past)
+                content_score = (qc @ kc.T)
+                score = speaker_score + content_score
+                k = min(self.top_k, past.size(0))
+                top_idx = score.topk(k).indices
+                summary = past[top_idx].mean(0)
+                mem[s_idx] = self.update_cell(summary, mem[s_idx])
+            new_memories.append(mem)
+        return tokens, new_memories  # return both stacked and list
+
+class SelectiveMemoryTransformer2(nn.Module):
+    
+    def __init__(self, config):
+        super().__init__()
+        H = config.hidden_size
+        self.token_emb = nn.Embedding(config.vocab_size, H)
+        self.pos_emb   = nn.Embedding(config.max_position_embeddings, H)
+        self.spk_emb   = nn.Embedding(config.max_speakers, H)
+
+        self.layers = nn.ModuleList([
+            SelectiveMemoryLayer2(H, config.intermediate_size, config.num_attention_heads,
+                                  dropout=config.hidden_dropout_prob, top_k=5)
+            for _ in range(config.num_hidden_layers)
+        ])
+
+    def forward(self, input_ids, attention_mask, speaker_names):
+        B, T, L = input_ids.shape
+        device = input_ids.device
+
+        # speaker id mapping per dialog
+        spk_maps, spk_ids_list = [], []
+        for dialog in speaker_names:
+            m = {n: i for i, n in enumerate(sorted(set(dialog)))}
+            spk_maps.append(m)
+            spk_ids_list.append(torch.tensor([m[n] for n in dialog], device=device))
+        speaker_ids = torch.stack(spk_ids_list)  # (B, T)
+
+        tok = self.token_emb(input_ids) + self.pos_emb(torch.arange(L, device=device).view(1,1,L))
+        tok += self.spk_emb(speaker_ids).unsqueeze(2)
+
+        # initial edu reps (mean pooling of embeddings)
+        mask_exp = attention_mask.unsqueeze(-1)
+        edu_reps = (tok * mask_exp).sum(2) / mask_exp.sum(2).clamp(min=1e-6)
+
+        # initialize memory per dialog
+        memories = [torch.zeros(len(m), self.layers[0].hidden_size, device=device) for m in spk_maps]
+
+        for layer in self.layers:
+            tok, memories = layer(tok, attention_mask, edu_reps, speaker_ids, memories)
+            # recompute edu reps after layer
+            edu_reps = (tok * mask_exp).sum(2) / mask_exp.sum(2).clamp(min=1e-6)
+
+        return tok, []  # (B, T, L, D) token-level embeddings
+
+# class SparseMemoryDialogTransformer(nn.Module):
+    
+#     def __init__(self, config):
+#         super().__init__()
+        
+#     def forward(
+#         self,
+#         input_ids : torch.Tensor,
+#         attention_mask : torch.Tensor,
+#         speaker_names : torch.Tensor
+#     ):
+        
+        # 1- Each edu is not useful (We can skip allow to model to decide to skip a memory update based on a gate)
+        # 2- Each edu need to be processed in relation with the other related edu
+        # 3- The choice of the edus should be given to the model. However, the model should be pusnished based on how many edus it selected as needed information
+        # 4- The choice of edus is based on two gates. One impacts the speaker selection, the other the direct content of the edu
+        # 5- Each edu is first encoded with two attention pooling for the edu choice (We add fixed speaker embeddings before encoding)
+        # 6- Each selected edu is also encoded a second time with a multilayer transformer with the memory added on the inputs 
+        # 7- The memory is updated while processing the dialog edu by edu for each speaker. It is updated using the contextualized tokens of the processed edu.
+        
+class SelectiveMemoryLayer3(nn.Module):
+    """Single transformer layer with dual‑gate sparse speaker memory update."""
+    def __init__(self, hidden_size, intermediate_size, n_heads, dropout=0.1, top_k=5, gate_threshold=0.5):
+        super().__init__()
+        self.h = hidden_size
+        self.top_k = top_k
+        self.th = gate_threshold
+        # ── vanilla transformer sub‑modules ───────────────────────────────
+        self.attn = MHA(embed_dim=hidden_size, num_heads=n_heads, dropout=dropout)
+        self.ffn  = nn.Sequential(
+            nn.Linear(hidden_size, intermediate_size),
+            activation_to_class["gelu"](), nn.Dropout(dropout),
+            nn.Linear(intermediate_size, hidden_size), nn.Dropout(dropout))
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size)
+        # ── dual gate scorers ─────────────────────────────────────────────
+        self.spk_gate  = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.Tanh(), nn.Linear(hidden_size, 1))
+        self.cnt_gate  = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.Tanh(), nn.Linear(hidden_size, 1))
+        # keys / queries for similarity
+        self.key_proj  = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.que_proj  = nn.Linear(hidden_size, hidden_size, bias=False)
+        # mini transformer on (current+retrieved)
+        self.mini_attn = MHA(embed_dim=hidden_size, num_heads=n_heads, dropout=dropout)
+        self.mini_ffn  = nn.Sequential(nn.Linear(hidden_size, intermediate_size), activation_to_class["gelu"](), nn.Linear(intermediate_size, hidden_size))
+        self.mininorm1 = nn.LayerNorm(hidden_size)
+        self.mininorm2 = nn.LayerNorm(hidden_size)
+        # GRUCell update
+        self.gru = nn.GRUCell(hidden_size, hidden_size)
+
+    def forward(self, tokens, mask, edu_reps, spk_ids, memories):
+        B, T, L, D = tokens.shape
+        device = tokens.device
+        # ① transformer pass
+        x = tokens.view(B*T, L, D); m = mask.view(B*T, L)
+        y = self.attn(x, key_padding_mask=~m.bool()); x = self.norm1(x+y)
+        y = self.ffn(x); x = self.norm2(x+y)
+        tokens = x.view(B, T, L, D)
+        # ② pool new edu reps
+        exp = mask.unsqueeze(-1)
+        new_edu = (tokens*exp).sum(2)/exp.sum(2).clamp(min=1e-6)  # (B,T,D)
+        # ③ for each dialog update memories
+        for b in range(B):
+            mem = memories[b]
+            for t in range(T):
+                cur = new_edu[b, t]
+                sid = spk_ids[b, t].item()
+                # speaker gate (keep if current speaker == candidate speaker)
+                same_spk = (spk_ids[b, :t]==sid)
+                if same_spk.sum()==0: continue
+                past = new_edu[b, :t][same_spk]                      # (Ns,D)
+                # content scores
+                q  = self.que_proj(cur); k = self.key_proj(past)
+                cnt_score = (q @ k.T)                                 # (Ns)
+                spk_gate_logits = self.spk_gate(past).squeeze(-1)     # (Ns)
+                cnt_gate_logits = self.cnt_gate(past).squeeze(-1)     # (Ns)
+                # apply separate gates
+                keep_mask = torch.sigmoid(spk_gate_logits) > self.th  # bool (Ns)
+                if keep_mask.sum()==0: continue
+                past_kept = past[keep_mask]
+                joint_score = cnt_score[keep_mask]
+                k_sel = min(self.top_k, past_kept.size(0))
+                top = joint_score.topk(k_sel).indices
+                chosen = torch.cat([cur.unsqueeze(0), past_kept[top]],0)  # (1+k,D)
+                # mini transformer
+                z = chosen.unsqueeze(0)  # (1, N, D)
+                z2 = self.mini_attn(z).squeeze(0); z = self.mininorm1(z.squeeze(0)+z2)
+                z2 = self.mini_ffn(z);    z = self.mininorm2(z+z2)
+                summary = z[0]            # updated representation of current edu
+                mem[sid] = self.gru(summary, mem[sid])
+            memories[b] = mem
+        flop_penalty = keep_mask.float().sum()
+        return tokens, memories, flop_penalty
+
+class SelectiveMemoryTransformer3(nn.Module):
+    
+    def __init__(self, cfg : SAUTEConfig):
+    
+        super().__init__(); H=cfg.hidden_size
+    
+        self.tok_emb = nn.Embedding(cfg.vocab_size,H)
+        self.pos_emb = nn.Embedding(cfg.max_position_embeddings,H)
+        self.spk_emb = nn.Embedding(cfg.max_speakers,H)
+    
+        self.layers  = nn.ModuleList([SelectiveMemoryLayer3(H,cfg.intermediate_size,cfg.num_attention_heads,cfg.hidden_dropout_prob,top_k=5) for _ in range(cfg.num_hidden_layers)])
+        
+        self.register_buffer("flop_counter", torch.zeros(1))
+    
+    def forward(
+        self,
+        input_ids : torch.Tensor,
+        attention_mask : torch.Tensor,
+        speaker_names : torch.Tensor
+    ):
+        B, T, L = input_ids.shape
+        dev     = input_ids.device
+        spk_maps , spk_ids_l = [], []
+        
+        for dlg in speaker_names:
+            m={n:i for i,n in enumerate(sorted(set(dlg)))}
+            spk_maps.append(m)
+            spk_ids_l.append(torch.tensor([m[n] for n in dlg], device=dev))
+        
+        spk_ids     = torch.stack(spk_ids_l)
+        tok         = self.tok_emb(input_ids)+self.pos_emb(torch.arange(L,device=dev))+self.spk_emb(spk_ids).unsqueeze(2)
+        mask        = attention_mask
+        memories    = [torch.zeros(len(m),self.layers[0].h,device=dev) for m in spk_maps]
+        exp_mask    = mask.unsqueeze(-1)
+        edu         = (tok * exp_mask).sum(2) / exp_mask.sum(2).clamp(min=1e-6)
+        
+        for layer in self.layers:
+            # add memory before layer
+            for b in range(B):
+                tok[b] += memories[b][spk_ids[b]].unsqueeze(2)
+            tok, memories, flop_penalty = layer(tok, mask , edu, spk_ids, memories)
+            if self.training:
+                self.flop_counter += flop_penalty
+            edu = (tok * exp_mask).sum(2) / exp_mask.sum(2).clamp(min=1e-6)
+            
+        return tok, self.flop_counter
 
 class UtteranceEmbedings(PreTrainedModel):
     config_class = SAUTEConfig
@@ -982,7 +1238,9 @@ class UtteranceEmbedings(PreTrainedModel):
         # self.saute_unit = BatchAwareHSauteUnit(config)
         # self.saute_unit = VerticalSpeakerMemoryTransformer(config)
         # self.saute_unit  = SpeakerGatedLocalTransformer(config)
-        self.saute_unit = SelectiveMemoryTransformer(config)
+        # self.saute_unit = SelectiveMemoryTransformer(config)
+        # self.saute_unit = SelectiveMemoryTransformer2(config)
+        self.saute_unit = SelectiveMemoryTransformer3(config)
 
         self.config : SAUTEConfig = config
         
@@ -996,7 +1254,7 @@ class UtteranceEmbedings(PreTrainedModel):
         labels          : torch.Tensor  = None
     ):
         # print(input_ids.shape)
-        X, _ = self.saute_unit.forward(
+        X, flop_penalty = self.saute_unit.forward(
             input_ids       =   input_ids,
             speaker_names   =   speaker_names,
             attention_mask  =   attention_mask,
@@ -1009,6 +1267,6 @@ class UtteranceEmbedings(PreTrainedModel):
         loss = None
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
+            loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1)) + 1e-3 * flop_penalty
 
         return MaskedLMOutput(loss=loss, logits=logits)
