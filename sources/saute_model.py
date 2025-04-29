@@ -1311,19 +1311,19 @@ class DiscourseTransformer(nn.Module):
         x += self.token_pe(torch.arange(L, device=device))
         
         selective_x = x + self.speaker_emb(speaker_ids).unsqueeze(2)
-        print(selective_x.shape)
+        # print(selective_x.shape)
         
         # (B, Number of speakers, D)
         speaker_memories = [torch.zeros(len(spk_map), self.config.hidden_size, device=device) for spk_map in spk_maps]
         
-        output = torch.empty(B, T, L, self.config.hidden_size, device=device)
+        output = []
         flop_penalty = 0.0
         
-        for l in range(T - 1):
+        for l in range(T):
             
             # x (B, T, L, D) -> x[:,l] (B, 1, L, D)
             # speaker_logits (B, L, D)
-            speaker_logits = self.speaker_gate(selective_x[:,l + 1].squeeze(1))
+            speaker_logits = self.speaker_gate(selective_x[:,l].squeeze(1))
             
             speaker_probs = []
             for b, speaker_memory in enumerate(speaker_memories):
@@ -1343,7 +1343,7 @@ class DiscourseTransformer(nn.Module):
             # (B, l, L, D) -> past_x
             past_x = selective_x[:,:l + 1]
             # broadcasted_edu (B, l, L, D)
-            broadcasted_edu = selective_x[:,l + 1].unsqueeze(1).broadcast_to(past_x.shape)
+            broadcasted_edu = selective_x[:,l].unsqueeze(1).broadcast_to(past_x.shape)
             # New x (B, l, L*2, D)
             # ADD RELATIVE PE TO EACH PAST X so the model now where it is compared to the current broadcasted_edu
             relative_x = torch.concat([past_x, broadcasted_edu], dim=2)
@@ -1356,8 +1356,8 @@ class DiscourseTransformer(nn.Module):
             # Apply transformer plus crop to take only the needed tokens -> (B, L, D)
             x_i = self.main_gate(reshaped_relative_x).reshape(B, (l + 1), L * 2, self.config.hidden_size)[:,:,L:].mean(dim=1)
             # print(output.shape, x_i.shape)
-            output[:,l] = x_i
-            print("update",  l)
+            output.append(x_i.unsqueeze(1))
+            # print("update",  l)
             
             scores = torch.tanh(self.pool_W(x_i)) @ self.pool_v
             scores = scores.squeeze(-1)
@@ -1385,8 +1385,10 @@ class DiscourseTransformer(nn.Module):
                 
                 # 4) GRU-style memory update
                 mem[speaker_ids[b, l].item()] = self.gru(edu_vec[b], mem[speaker_ids[b, l].item()])
-                speaker_memories[b] = mem
+                speaker_memories[b] = speaker_memories[b] + mem
                 
+        output = torch.concat(output, dim=1)
+        # print(output.shape)
         flop_penalty = flop_penalty / T
         return output, flop_penalty
         
