@@ -1397,7 +1397,8 @@ class UtteranceEmbedings(PreTrainedModel):
         # self.saute_unit  = SpeakerGatedLocalTransformer(config)
         # self.saute_unit = SelectiveMemoryTransformer(config)
         # self.saute_unit = SelectiveMemoryTransformer2(config)
-        self.saute_unit = SelectiveMemoryTransformer3(config)
+        # self.saute_unit = SelectiveMemoryTransformer3(config)
+        self.saute_unit = DiscourseTransformer(config)
 
         self.config : SAUTEConfig = config
         
