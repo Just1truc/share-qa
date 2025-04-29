@@ -1384,8 +1384,8 @@ class DiscourseTransformer(nn.Module):
                     continue
                 
                 # 4) GRU-style memory update
-                mem[speaker_ids[b, l].item()] = self.gru(edu_vec[b], mem[speaker_ids[b, l].item()])
-                speaker_memories[b] = speaker_memories[b] + mem
+                mem[speaker_ids[b, l].item()] = mem[speaker_ids[b, l].item()] + self.gru(edu_vec[b], mem[speaker_ids[b, l].item()])
+                speaker_memories[b] = mem
                 
         output = torch.concat(output, dim=1)
         # print(output.shape)
