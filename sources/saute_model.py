@@ -1307,7 +1307,7 @@ class DiscourseTransformer(nn.Module):
         # (B, T)
         speaker_ids = torch.stack(spk_ids_list)
         
-        x = self.token_embeddings(x)
+        x = self.token_embeddings(input_ids)
         x += self.token_pe(torch.arange(L, device=device))
         
         selective_x = x + self.speaker_emb(speaker_ids).unsqueeze(2)
@@ -1346,6 +1346,12 @@ class DiscourseTransformer(nn.Module):
             # New x (B, l, L*2, D)
             # ADD RELATIVE PE TO EACH PAST X so the model now where it is compared to the current broadcasted_edu
             relative_x = torch.concat([past_x, broadcasted_edu], dim=2)
+            dist_ids = torch.arange(l, 0, -1, device=device)
+            dist_ids = dist_ids.clamp(max=self.config.max_edus_per_dialog)
+            dist_ids = torch.cat([dist_ids, torch.zeros(1, device=device, dtype=dist_ids.dtype)])
+            dist_ids = torch.cat([dist_ids] * L)
+            rel_ids = dist_ids.unsqueeze(0).unsqueeze(0).expand(B, l, -1)
+            relative_x = relative_x + self.edu_pe(rel_ids)
             
             # Apply transformer plus crop to take only the needed tokens -> (B, L, D)
             x_i = self.main_gate(relative_x)[:,:,L:].mean(dim=1)
