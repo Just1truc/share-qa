@@ -1226,7 +1226,7 @@ class SelectiveMemoryTransformer3(nn.Module):
             edu = (tok * exp_mask).sum(2) / exp_mask.sum(2).clamp(min=1e-6)
             
         return tok, self.flop_counter
-
+    
 class DiscourseTransformer(nn.Module):
     
     def __init__(self, config : SAUTEConfig):
@@ -1384,7 +1384,7 @@ class DiscourseTransformer(nn.Module):
                     continue
                 
                 # 4) GRU-style memory update
-                mem[speaker_ids[b, l].item()] = mem[speaker_ids[b, l].item()] + self.gru(edu_vec[b], mem[speaker_ids[b, l].item()])
+                mem[speaker_ids[b, l].item()] = self.gru(edu_vec[b], mem[speaker_ids[b, l].item()])
                 speaker_memories[b] = mem
                 
         output = torch.concat(output, dim=1)
