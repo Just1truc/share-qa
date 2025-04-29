@@ -1311,6 +1311,7 @@ class DiscourseTransformer(nn.Module):
         x += self.token_pe(torch.arange(L, device=device))
         
         selective_x = x + self.speaker_emb(speaker_ids).unsqueeze(2)
+        print(selective_x.shape)
         
         # (B, Number of speakers, D)
         speaker_memories = [torch.zeros(len(spk_map), self.config.hidden_size, device=device) for spk_map in spk_maps]
@@ -1318,20 +1319,20 @@ class DiscourseTransformer(nn.Module):
         output = torch.empty(B, T, L, self.config.hidden_size, device=device)
         flop_penalty = 0.0
         
-        for l in range(T):
+        for l in range(T - 1):
             
             # x (B, T, L, D) -> x[:,l] (B, 1, L, D)
             # speaker_logits (B, L, D)
-            speaker_logits = self.speaker_gate(selective_x[:,l].squeeze(1))
+            speaker_logits = self.speaker_gate(selective_x[:,l + 1].squeeze(1))
             
             speaker_probs = []
             for b, speaker_memory in enumerate(speaker_memories):
                 
                 # Speaker memory (Number of Speakers, D)
                 # Get the most linked edus
-                speaker_probabilities = self.softmax((speaker_memory @ speaker_logits[b].T).max(dim = 1).values)
+                speaker_probabilities = torch.softmax((speaker_memory @ speaker_logits[b].T).max(dim = 1).values, dim=0)
                 # Output (Number of speakers,)
-                speaker_probs.append(speaker_probabilities[speaker_ids[b][:l]])
+                speaker_probs.append(speaker_probabilities[speaker_ids[b][:l + 1]])
             
             speaker_probs = torch.stack(speaker_probs)
             
@@ -1340,22 +1341,23 @@ class DiscourseTransformer(nn.Module):
             flop_penalty += entropy.mean()
     
             # (B, l, L, D) -> past_x
-            past_x = selective_x[:,:l]
+            past_x = selective_x[:,:l + 1]
             # broadcasted_edu (B, l, L, D)
-            broadcasted_edu = selective_x[:,l].unsqueeze(1).broadcast_to(past_x)
+            broadcasted_edu = selective_x[:,l + 1].unsqueeze(1).broadcast_to(past_x.shape)
             # New x (B, l, L*2, D)
             # ADD RELATIVE PE TO EACH PAST X so the model now where it is compared to the current broadcasted_edu
             relative_x = torch.concat([past_x, broadcasted_edu], dim=2)
-            dist_ids = torch.arange(l, 0, -1, device=device)
-            dist_ids = dist_ids.clamp(max=self.config.max_edus_per_dialog)
-            dist_ids = torch.cat([dist_ids, torch.zeros(1, device=device, dtype=dist_ids.dtype)])
-            dist_ids = torch.cat([dist_ids] * L)
-            rel_ids = dist_ids.unsqueeze(0).unsqueeze(0).expand(B, l, -1)
+            rel_ids = torch.arange(l, -1, -1, device=device).unsqueeze(0).unsqueeze(2).broadcast_to(B, l + 1, L)
+            rel_ids = torch.concat([rel_ids, torch.zeros(B, l + 1, L, device=device)], dim = 2).long()
+            # print(self.edu_pe(rel_ids).shape, relative_x.shape)
             relative_x = relative_x + self.edu_pe(rel_ids)
             
+            reshaped_relative_x = relative_x.reshape(B * (l + 1), L * 2, self.config.hidden_size)
             # Apply transformer plus crop to take only the needed tokens -> (B, L, D)
-            x_i = self.main_gate(relative_x)[:,:,L:].mean(dim=1)
-            output[l] = x_i
+            x_i = self.main_gate(reshaped_relative_x).reshape(B, (l + 1), L * 2, self.config.hidden_size)[:,:,L:].mean(dim=1)
+            # print(output.shape, x_i.shape)
+            output[:,l] = x_i
+            print("update",  l)
             
             scores = torch.tanh(self.pool_W(x_i)) @ self.pool_v
             scores = scores.squeeze(-1)
@@ -1372,9 +1374,8 @@ class DiscourseTransformer(nn.Module):
             for b in range(B):
                 
                 mem  = speaker_memories[b]
-                sid_cur = speaker_ids[b, l].item()
 
-                p_spk = speaker_probs[b][sid_cur] if speaker_probs.dim() == 2 else speaker_probs[b, -1, sid_cur]
+                p_spk = speaker_probs[b][l]
                 p_cnt = self.update_gate(edu_vec[b])
 
                 # 3) final gate decision
@@ -1383,7 +1384,7 @@ class DiscourseTransformer(nn.Module):
                     continue
                 
                 # 4) GRU-style memory update
-                mem[sid_cur] = self.gru(edu_vec[b], mem[sid_cur])
+                mem[speaker_ids[b, l].item()] = self.gru(edu_vec[b], mem[speaker_ids[b, l].item()])
                 speaker_memories[b] = mem
                 
         flop_penalty = flop_penalty / T
