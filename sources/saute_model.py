@@ -1313,9 +1313,9 @@ class DiscourseTransformer(nn.Module):
         selective_x = x + self.speaker_emb(speaker_ids).unsqueeze(2)
         
         # (B, Number of speakers, D)
-        speaker_memories = [torch.zeros(len(spk_map), self.config.hidden_size) for spk_map in spk_maps]
+        speaker_memories = [torch.zeros(len(spk_map), self.config.hidden_size, device=device) for spk_map in spk_maps]
         
-        output = torch.empty(B, T, L, self.config.hidden_size)
+        output = torch.empty(B, T, L, self.config.hidden_size, device=device)
         flop_penalty = 0.0
         
         for l in range(T):
