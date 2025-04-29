@@ -1329,7 +1329,7 @@ class DiscourseTransformer(nn.Module):
                 
                 # Speaker memory (Number of Speakers, D)
                 # Get the most linked edus
-                speaker_probabilities = self.softmax((speaker_memory @ speaker_logits[b].T).max(dim = 1))
+                speaker_probabilities = self.softmax((speaker_memory @ speaker_logits[b].T).max(dim = 1).values)
                 # Output (Number of speakers,)
                 speaker_probs.append(speaker_probabilities[speaker_ids[b][:l]])
             
