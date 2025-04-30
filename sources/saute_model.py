@@ -1354,7 +1354,7 @@ class DiscourseTransformer(nn.Module):
             
             reshaped_relative_x = relative_x.reshape(B * (l + 1), L * 2, self.config.hidden_size)
             # Apply transformer plus crop to take only the needed tokens -> (B, L, D)
-            x_i = self.main_gate(reshaped_relative_x).reshape(B, (l + 1), L * 2, self.config.hidden_size)[:,:,L:].mean(dim=1)
+            x_i = (self.main_gate(reshaped_relative_x).reshape(B, (l + 1), L * 2, self.config.hidden_size)[:,:,L:].mean(dim=1) * speaker_probs)
             # print(output.shape, x_i.shape)
             output.append(x_i.unsqueeze(1))
             # print("update",  l)
@@ -1392,6 +1392,91 @@ class DiscourseTransformer(nn.Module):
         flop_penalty = flop_penalty / T
         return output, flop_penalty
         
+
+class NOSMDiscourseTransformer(nn.Module):
+    
+    def __init__(self, config : SAUTEConfig):
+        super().__init__()
+        
+        self.token_embeddings = nn.Embedding(
+            num_embeddings  = config.vocab_size,
+            embedding_dim   = config.hidden_size
+        )
+        self.token_pe   = nn.Embedding(
+            num_embeddings  = config.max_position_embeddings,
+            embedding_dim   = config.hidden_size            
+        )
+        self.edu_pe     = nn.Embedding(
+            num_embeddings  = config.max_edus_per_dialog,
+            embedding_dim   = config.hidden_size
+        )
+        self.speaker_emb = nn.Embedding(
+            num_embeddings  = config.max_speakers,
+            embedding_dim   = config.hidden_size
+        )
+        
+        self.main_gate = FlashTransformerEncoder(
+            d_model         = config.hidden_size,
+            n_heads         = config.num_attention_heads,
+            dropout         = config.hidden_dropout_prob,
+            dim_feedforward = config.intermediate_size,
+            n_layers        = config.num_hidden_layers
+        )
+        self.config = config
+        
+        self.pool_W = nn.Linear(self.config.hidden_size, self.config.hidden_size)
+        self.pool_v = nn.Parameter(torch.empty(self.config.hidden_size, 1))
+        nn.init.xavier_uniform_(self.pool_v)
+        
+    def forward(
+        self,
+        input_ids       : torch.Tensor,
+        attention_mask  : torch.Tensor,
+        speaker_names   : list[str]
+    ):
+        device = input_ids.device
+        B, T, L = input_ids.shape
+        
+        spk_maps, spk_ids_list = [], []
+        for dialog in speaker_names:
+            m = {n: i for i, n in enumerate(sorted(set(dialog)))}
+            spk_maps.append(m)
+            spk_ids_list.append(torch.tensor([m[n] for n in dialog], device=device))
+        
+        # (B, T)
+        speaker_ids = torch.stack(spk_ids_list)
+        
+        x = self.token_embeddings(input_ids)
+        x += self.token_pe(torch.arange(L, device=device))
+        
+        selective_x = x + self.speaker_emb(speaker_ids).unsqueeze(2)
+        
+        output = []
+        
+        for l in range(T):
+            
+            # (B, l, L, D) -> past_x
+            past_x = selective_x[:,:l + 1]
+            # broadcasted_edu (B, l, L, D)
+            broadcasted_edu = selective_x[:,l].unsqueeze(1).broadcast_to(past_x.shape)
+            # New x (B, l, L*2, D)
+            # ADD RELATIVE PE TO EACH PAST X so the model now where it is compared to the current broadcasted_edu
+            relative_x = torch.concat([past_x, broadcasted_edu], dim=2)
+            rel_ids = torch.arange(l, -1, -1, device=device).unsqueeze(0).unsqueeze(2).broadcast_to(B, l + 1, L)
+            rel_ids = torch.concat([rel_ids, torch.zeros(B, l + 1, L, device=device)], dim = 2).long()
+            # print(self.edu_pe(rel_ids).shape, relative_x.shape)
+            relative_x = relative_x + self.edu_pe(rel_ids)
+            
+            reshaped_relative_x = relative_x.reshape(B * (l + 1), L * 2, self.config.hidden_size)
+            # Apply transformer plus crop to take only the needed tokens -> (B, L, D)
+            x_i = self.main_gate(reshaped_relative_x).reshape(B, (l + 1), L * 2, self.config.hidden_size)[:,:,L:].mean(dim=1)
+            # print(output.shape, x_i.shape)
+            output.append(x_i.unsqueeze(1))
+            # print("update",  l)
+                
+        output = torch.concat(output, dim=1)
+        # print(output.shape)
+        return output, 0
 
 class UtteranceEmbedings(PreTrainedModel):
     config_class = SAUTEConfig
