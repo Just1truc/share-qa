@@ -1354,7 +1354,9 @@ class DiscourseTransformer(nn.Module):
             
             reshaped_relative_x = relative_x.reshape(B * (l + 1), L * 2, self.config.hidden_size)
             # Apply transformer plus crop to take only the needed tokens -> (B, L, D)
-            x_i = (self.main_gate(reshaped_relative_x).reshape(B, (l + 1), L * 2, self.config.hidden_size)[:,:,L:].mean(dim=1) * speaker_probs)
+            x_i = self.main_gate(reshaped_relative_x).reshape(B, (l + 1), L * 2, self.config.hidden_size)[:,:,L:]
+            # print(x_i.shape, speaker_probs.shape)
+            x_i = (x_i * speaker_probs.unsqueeze(-1).unsqueeze(-1)).mean(dim=1)
             # print(output.shape, x_i.shape)
             output.append(x_i.unsqueeze(1))
             # print("update",  l)
@@ -1392,6 +1394,334 @@ class DiscourseTransformer(nn.Module):
         flop_penalty = flop_penalty / T
         return output, flop_penalty
         
+class MemoryBankDiscourseTransformer(nn.Module):
+    
+    def __init__(self, config : SAUTEConfig):
+        super().__init__()
+        
+        self.update_threshold   = 0.5
+        self.speaker_threshold  = 0.1
+        
+        self.speaker_gate = FlashTransformer(
+            d_model         = config.hidden_size,
+            n_heads         = config.num_attention_heads,
+            dropout         = config.hidden_dropout_prob,
+            dim_feedforward = config.intermediate_size
+        )
+        self.context_gate = FlashTransformer(
+            d_model         = config.hidden_size,
+            n_heads         = config.num_attention_heads,
+            dropout         = config.hidden_dropout_prob,
+            dim_feedforward = config.intermediate_size
+        )
+        self.softmax = nn.Softmax()
+        self.token_embeddings = nn.Embedding(
+            num_embeddings  = config.vocab_size,
+            embedding_dim   = config.hidden_size
+        )
+        self.token_pe   = nn.Embedding(
+            num_embeddings  = config.max_position_embeddings,
+            embedding_dim   = config.hidden_size            
+        )
+        self.edu_pe     = nn.Embedding(
+            num_embeddings  = config.max_edus_per_dialog,
+            embedding_dim   = config.hidden_size
+        )
+        self.speaker_emb = nn.Embedding(
+            num_embeddings  = config.max_speakers,
+            embedding_dim   = config.hidden_size
+        )
+        
+        self.main_gate = FlashTransformerEncoder(
+            d_model         = config.hidden_size,
+            n_heads         = config.num_attention_heads,
+            dropout         = config.hidden_dropout_prob,
+            dim_feedforward = config.intermediate_size,
+            n_layers        = config.num_hidden_layers
+        )
+        self.config = config
+        
+        self.update_gate = nn.Sequential(
+            nn.Linear(
+                in_features     = config.hidden_size,
+                out_features    = 1
+            ),
+            nn.Sigmoid()
+        )
+        
+        self.pool_W = nn.Linear(self.config.hidden_size, self.config.hidden_size)
+        self.pool_v = nn.Parameter(torch.empty(self.config.hidden_size, 1))
+        nn.init.xavier_uniform_(self.pool_v)
+        
+        self.gru = nn.GRUCell(config.hidden_size, config.hidden_size)
+        self.sigmoid = nn.Sigmoid()
+
+        self.memory_bank_size = 32  # or 64, etc.
+        self.memory_bank = nn.Parameter(
+            torch.zeros(self.memory_bank_size, self.config.hidden_size),
+            requires_grad=False  # updated manually
+        )
+        self.memory_keys = nn.Parameter(
+            torch.zeros(self.memory_bank_size, self.config.hidden_size),
+            requires_grad=False
+        )
+        self.memory_usage = torch.zeros(self.memory_bank_size)  # for replacement
+
+        
+    def forward(
+        self,
+        input_ids       : torch.Tensor,
+        attention_mask  : torch.Tensor,
+        speaker_names   : list[str]
+    ):
+        device = input_ids.device
+        B, T, L = input_ids.shape
+        
+        spk_maps, spk_ids_list = [], []
+        for dialog in speaker_names:
+            m = {n: i for i, n in enumerate(sorted(set(dialog)))}
+            spk_maps.append(m)
+            spk_ids_list.append(torch.tensor([m[n] for n in dialog], device=device))
+        
+        # (B, T)
+        speaker_ids = torch.stack(spk_ids_list)
+        
+        x = self.token_embeddings(input_ids)
+        x += self.token_pe(torch.arange(L, device=device))
+        
+        selective_x = x + self.speaker_emb(speaker_ids).unsqueeze(2)
+        # print(selective_x.shape)
+        
+        # (B, Number of speakers, D)
+        # speaker_memories = [torch.zeros(len(spk_map), self.config.hidden_size, device=device) for spk_map in spk_maps]
+        
+        output = []
+        flop_penalty = 0.0
+        
+        for l in range(T):
+            
+            # x (B, T, L, D) -> x[:,l] (B, 1, L, D)
+            # speaker_logits (B, L, D)
+            # speaker_logits = self.speaker_gate(selective_x[:,l].squeeze(1))
+            
+            # speaker_probs = []
+            # for b, speaker_memory in enumerate(speaker_memories):
+                
+            #     # Speaker memory (Number of Speakers, D)
+            #     # Get the most linked edus
+            #     speaker_probabilities = torch.softmax((speaker_memory @ speaker_logits[b].T).max(dim = 1).values, dim=0)
+            #     # Output (Number of speakers,)
+            #     speaker_probs.append(speaker_probabilities[speaker_ids[b][:l + 1]])
+            
+            # speaker_probs = torch.stack(speaker_probs)
+            
+            # last_probs = speaker_probs[:, -1]
+            # entropy    = -(last_probs * (last_probs + 1e-12).log()).sum(-1)
+            # flop_penalty += entropy.mean()
+    
+            # (B, l, L, D) -> past_x
+            # past_x = selective_x[:,:l + 1]
+            # # broadcasted_edu (B, l, L, D)
+            # broadcasted_edu = selective_x[:,l].unsqueeze(1).broadcast_to(past_x.shape)
+            # # New x (B, l, L*2, D)
+            # # ADD RELATIVE PE TO EACH PAST X so the model now where it is compared to the current broadcasted_edu
+            # relative_x = torch.concat([past_x, broadcasted_edu], dim=2)
+            # rel_ids = torch.arange(l, -1, -1, device=device).unsqueeze(0).unsqueeze(2).broadcast_to(B, l + 1, L)
+            # rel_ids = torch.concat([rel_ids, torch.zeros(B, l + 1, L, device=device)], dim = 2).long()
+            # # print(self.edu_pe(rel_ids).shape, relative_x.shape)
+            # relative_x = relative_x + self.edu_pe(rel_ids)
+            
+            # reshaped_relative_x = relative_x.reshape(B * (l + 1), L * 2, self.config.hidden_size)
+            # # Apply transformer plus crop to take only the needed tokens -> (B, L, D)
+            # x_i = self.main_gate(reshaped_relative_x).reshape(B, (l + 1), L * 2, self.config.hidden_size)[:,:,L:]
+
+            q_vec = selective_x[:, l].mean(dim=1)  # (B, D)
+
+            # --- Attend over memory bank ---
+            attn_logits = torch.matmul(q_vec, self.memory_keys.T)   # (B, K)
+            attn_weights = torch.softmax(attn_logits, dim=-1)       # (B, K)
+
+            # Weighted sum
+            mem_ctx = torch.matmul(attn_weights, self.memory_bank)  # (B, D)
+
+            # --- Fuse memory with current EDU
+            fused = selective_x[:, l] + mem_ctx.unsqueeze(1)        # (B, L, D)
+            x_i = self.main_gate(fused)                 # (B, L, D)
+
+            # print(x_i.shape, speaker_probs.shape)
+            # x_i = (x_i * speaker_probs.unsqueeze(-1).unsqueeze(-1)).mean(dim=1)
+            # print(output.shape, x_i.shape)
+            output.append(x_i.unsqueeze(1))
+            # print("update",  l)
+            
+            scores = torch.tanh(self.pool_W(x_i)) @ self.pool_v
+            scores = scores.squeeze(-1)
+
+            mask_cur   = attention_mask[:, l].bool()
+            scores = scores.masked_fill(~mask_cur, -1e4)
+
+            alpha = torch.softmax(scores, dim=-1)             
+
+            edu_vec = (alpha.unsqueeze(-1) * x_i).sum(dim=1)
+            
+            # Use speaker memory to know if update is needed
+            # speaker_probs (B, l)
+            for b in range(B):
+                
+                # p_spk = speaker_probs[b][l]
+                p_cnt = self.update_gate(edu_vec[b])
+                p_update = p_cnt
+
+                if p_update < self.update_threshold:
+                    continue
+
+                idx = torch.argmin(self.memory_usage)
+                self.memory_bank.data[idx] = edu_vec[b].detach()
+                self.memory_keys.data[idx] = q_vec[b].detach()
+                self.memory_usage[idx] = 1.0
+
+            self.memory_usage *= 0.98
+                
+        output = torch.concat(output, dim=1)
+        # print(output.shape)
+        # flop_penalty = flop_penalty / T
+        return output, flop_penalty
+
+class NOCEDiscourseTransformer(nn.Module):
+    
+    def __init__(self, config : SAUTEConfig):
+        super().__init__()
+        
+        self.update_threshold   = 0.5
+        self.speaker_threshold  = 0.1
+        
+        self.speaker_gate = FlashTransformer(
+            d_model         = config.hidden_size,
+            n_heads         = config.num_attention_heads,
+            dropout         = config.hidden_dropout_prob,
+            dim_feedforward = config.intermediate_size
+        )
+        self.softmax = nn.Softmax()
+        self.token_embeddings = nn.Embedding(
+            num_embeddings  = config.vocab_size,
+            embedding_dim   = config.hidden_size
+        )
+        self.token_pe   = nn.Embedding(
+            num_embeddings  = config.max_position_embeddings,
+            embedding_dim   = config.hidden_size            
+        )
+        self.edu_pe     = nn.Embedding(
+            num_embeddings  = config.max_edus_per_dialog,
+            embedding_dim   = config.hidden_size
+        )
+        self.speaker_emb = nn.Embedding(
+            num_embeddings  = config.max_speakers,
+            embedding_dim   = config.hidden_size
+        )
+        
+        self.main_gate = FlashTransformerEncoder(
+            d_model         = config.hidden_size,
+            n_heads         = config.num_attention_heads,
+            dropout         = config.hidden_dropout_prob,
+            dim_feedforward = config.intermediate_size,
+            n_layers        = config.num_hidden_layers
+        )
+        self.config = config
+        
+        # self.update_gate = nn.Sequential(
+        #     nn.Linear(
+        #         in_features     = config.hidden_size,
+        #         out_features    = 1
+        #     ),
+        #     nn.Sigmoid()
+        # )
+        
+        self.pool_W = nn.Linear(self.config.hidden_size, self.config.hidden_size)
+        self.pool_v = nn.Parameter(torch.empty(self.config.hidden_size, 1))
+        nn.init.xavier_uniform_(self.pool_v)
+        
+        self.gru = nn.GRUCell(config.hidden_size, config.hidden_size)
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(
+        self,
+        input_ids       : torch.Tensor,
+        attention_mask  : torch.Tensor,
+        speaker_names   : list[str]
+    ):
+        device = input_ids.device
+        B, T, L = input_ids.shape
+        
+        spk_maps, spk_ids_list = [], []
+        for dialog in speaker_names:
+            m = {n: i for i, n in enumerate(sorted(set(dialog)))}
+            spk_maps.append(m)
+            spk_ids_list.append(torch.tensor([m[n] for n in dialog], device=device))
+        
+        # (B, T)
+        speaker_ids = torch.stack(spk_ids_list)
+        
+        x = self.token_embeddings(input_ids)
+        x += self.token_pe(torch.arange(L, device=device))
+        
+        selective_x = x + self.speaker_emb(speaker_ids).unsqueeze(2)
+        # print(selective_x.shape)
+        
+        # (B, Number of speakers, D)
+        speaker_memories = [torch.zeros(len(spk_map), self.config.hidden_size, device=device) for spk_map in spk_maps]
+        
+        output = []
+        flop_penalty = 0.0
+        
+        for l in range(T):
+            
+            # x (B, T, L, D) -> x[:,l] (B, 1, L, D)
+            # speaker_logits (B, L, D)
+            speaker_logits = self.speaker_gate(selective_x[:,l].squeeze(1))
+            
+            # speaker_probs = []
+            cross_speaker_mem = []
+            for b, speaker_memory in enumerate(speaker_memories):
+                
+                # Speaker memory (Number of Speakers, D)
+                # Get the most linked edus
+                speaker_probabilities = torch.softmax((speaker_memory @ speaker_logits[b].T).max(dim = 1).values, dim=0)
+                # Output (Number of speakers,)
+                # speaker_probs.append(speaker_probabilities[speaker_ids[b][:l + 1]])
+                cross_speaker_mem.append(speaker_probabilities @ speaker_memory)
+            
+            # (B, D)
+            cross_speaker_mem = torch.stack(cross_speaker_mem)
+            
+            x_i = self.main_gate(selective_x[:,l] + cross_speaker_mem)
+            # print(x_i.shape, speaker_probs.shape)
+            # print(output.shape, x_i.shape)
+            output.append(x_i.unsqueeze(1))
+            # print("update",  l)
+            
+            scores = torch.tanh(self.pool_W(x_i)) @ self.pool_v
+            scores = scores.squeeze(-1)
+
+            mask_cur   = attention_mask[:, l].bool()
+            scores = scores.masked_fill(~mask_cur, -1e4)
+
+            alpha = torch.softmax(scores, dim=-1)             
+
+            edu_vec = (alpha.unsqueeze(-1) * x_i).sum(dim=1)
+            
+            # Use speaker memory to know if update is needed
+            # speaker_probs (B, l)
+            for b in range(B):
+                
+                mem  = speaker_memories[b]
+                mem[speaker_ids[b, l].item()] = self.gru(edu_vec[b], cross_speaker_mem[b])
+                speaker_memories[b] = mem
+                
+        output = torch.concat(output, dim=1)
+        # print(output.shape)
+        flop_penalty = flop_penalty / T
+        return output, flop_penalty
+
 
 class NOSMDiscourseTransformer(nn.Module):
     
@@ -1428,6 +1758,8 @@ class NOSMDiscourseTransformer(nn.Module):
         self.pool_v = nn.Parameter(torch.empty(self.config.hidden_size, 1))
         nn.init.xavier_uniform_(self.pool_v)
         
+        self.norm = nn.LayerNorm(config.hidden_size)
+
     def forward(
         self,
         input_ids       : torch.Tensor,
@@ -1465,11 +1797,11 @@ class NOSMDiscourseTransformer(nn.Module):
             rel_ids = torch.arange(l, -1, -1, device=device).unsqueeze(0).unsqueeze(2).broadcast_to(B, l + 1, L)
             rel_ids = torch.concat([rel_ids, torch.zeros(B, l + 1, L, device=device)], dim = 2).long()
             # print(self.edu_pe(rel_ids).shape, relative_x.shape)
-            relative_x = relative_x + self.edu_pe(rel_ids)
+            relative_x = self.norm(relative_x + self.edu_pe(rel_ids))
             
             reshaped_relative_x = relative_x.reshape(B * (l + 1), L * 2, self.config.hidden_size)
             # Apply transformer plus crop to take only the needed tokens -> (B, L, D)
-            x_i = self.main_gate(reshaped_relative_x).reshape(B, (l + 1), L * 2, self.config.hidden_size)[:,:,L:].mean(dim=1)
+            x_i = self.main_gate(reshaped_relative_x).reshape(B, (l + 1), L * 2, self.config.hidden_size)[:,:,L:].max(dim=1).values
             # print(output.shape, x_i.shape)
             output.append(x_i.unsqueeze(1))
             # print("update",  l)
@@ -1477,6 +1809,7 @@ class NOSMDiscourseTransformer(nn.Module):
         output = torch.concat(output, dim=1)
         # print(output.shape)
         return output, 0
+
 
 class UtteranceEmbedings(PreTrainedModel):
     config_class = SAUTEConfig
@@ -1492,7 +1825,10 @@ class UtteranceEmbedings(PreTrainedModel):
         # self.saute_unit = SelectiveMemoryTransformer(config)
         # self.saute_unit = SelectiveMemoryTransformer2(config)
         # self.saute_unit = SelectiveMemoryTransformer3(config)
-        self.saute_unit = DiscourseTransformer(config)
+        # self.saute_unit = DiscourseTransformer(config)
+        # self.saute_unit = NOSMDiscourseTransformer(config)
+        # self.saute_unit = NOCEDiscourseTransformer(config)
+        self.saute_unit = MemoryBankDiscourseTransformer(config)
 
         self.config : SAUTEConfig = config
         
@@ -1519,6 +1855,7 @@ class UtteranceEmbedings(PreTrainedModel):
         loss = None
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1)) + 1e-3 * flop_penalty
+            # loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1)) + 1e-3 * flop_penalty
+            loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
 
         return MaskedLMOutput(loss=loss, logits=logits)
