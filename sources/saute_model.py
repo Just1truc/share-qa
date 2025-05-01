@@ -1456,17 +1456,7 @@ class MemoryBankDiscourseTransformer(nn.Module):
         self.gru = nn.GRUCell(config.hidden_size, config.hidden_size)
         self.sigmoid = nn.Sigmoid()
 
-        self.memory_bank_size = 32  # or 64, etc.
-        self.memory_bank = nn.Parameter(
-            torch.zeros(self.memory_bank_size, self.config.hidden_size),
-            requires_grad=False  # updated manually
-        )
-        self.memory_keys = nn.Parameter(
-            torch.zeros(self.memory_bank_size, self.config.hidden_size),
-            requires_grad=False
-        )
-        self.memory_usage = torch.zeros(self.memory_bank_size)  # for replacement
-
+        self.memory_bank_size = 16  # or 64, etc.
         
     def forward(
         self,
@@ -1476,6 +1466,7 @@ class MemoryBankDiscourseTransformer(nn.Module):
     ):
         device = input_ids.device
         B, T, L = input_ids.shape
+        K = self.memory_bank_size
         
         spk_maps, spk_ids_list = [], []
         for dialog in speaker_names:
@@ -1495,64 +1486,26 @@ class MemoryBankDiscourseTransformer(nn.Module):
         # (B, Number of speakers, D)
         # speaker_memories = [torch.zeros(len(spk_map), self.config.hidden_size, device=device) for spk_map in spk_maps]
         
+        memory_bank = torch.zeros(B, K, self.config.hidden_size, device=device)
+        memory_keys = torch.zeros(B, K, self.config.hidden_size, device=device)
+        memory_usage = torch.zeros(B, K, device=device)
+
         output = []
         flop_penalty = 0.0
         
         for l in range(T):
             
-            # x (B, T, L, D) -> x[:,l] (B, 1, L, D)
-            # speaker_logits (B, L, D)
-            # speaker_logits = self.speaker_gate(selective_x[:,l].squeeze(1))
-            
-            # speaker_probs = []
-            # for b, speaker_memory in enumerate(speaker_memories):
-                
-            #     # Speaker memory (Number of Speakers, D)
-            #     # Get the most linked edus
-            #     speaker_probabilities = torch.softmax((speaker_memory @ speaker_logits[b].T).max(dim = 1).values, dim=0)
-            #     # Output (Number of speakers,)
-            #     speaker_probs.append(speaker_probabilities[speaker_ids[b][:l + 1]])
-            
-            # speaker_probs = torch.stack(speaker_probs)
-            
-            # last_probs = speaker_probs[:, -1]
-            # entropy    = -(last_probs * (last_probs + 1e-12).log()).sum(-1)
-            # flop_penalty += entropy.mean()
-    
-            # (B, l, L, D) -> past_x
-            # past_x = selective_x[:,:l + 1]
-            # # broadcasted_edu (B, l, L, D)
-            # broadcasted_edu = selective_x[:,l].unsqueeze(1).broadcast_to(past_x.shape)
-            # # New x (B, l, L*2, D)
-            # # ADD RELATIVE PE TO EACH PAST X so the model now where it is compared to the current broadcasted_edu
-            # relative_x = torch.concat([past_x, broadcasted_edu], dim=2)
-            # rel_ids = torch.arange(l, -1, -1, device=device).unsqueeze(0).unsqueeze(2).broadcast_to(B, l + 1, L)
-            # rel_ids = torch.concat([rel_ids, torch.zeros(B, l + 1, L, device=device)], dim = 2).long()
-            # # print(self.edu_pe(rel_ids).shape, relative_x.shape)
-            # relative_x = relative_x + self.edu_pe(rel_ids)
-            
-            # reshaped_relative_x = relative_x.reshape(B * (l + 1), L * 2, self.config.hidden_size)
-            # # Apply transformer plus crop to take only the needed tokens -> (B, L, D)
-            # x_i = self.main_gate(reshaped_relative_x).reshape(B, (l + 1), L * 2, self.config.hidden_size)[:,:,L:]
-
             q_vec = selective_x[:, l].mean(dim=1)  # (B, D)
 
-            # --- Attend over memory bank ---
-            attn_logits = torch.matmul(q_vec, self.memory_keys.T)   # (B, K)
+            attn_logits = torch.bmm(memory_keys, q_vec.unsqueeze(2)).squeeze(-1)  # (B, K)
             attn_weights = torch.softmax(attn_logits, dim=-1)       # (B, K)
 
-            # Weighted sum
-            mem_ctx = torch.matmul(attn_weights, self.memory_bank)  # (B, D)
+            mem_ctx = torch.bmm(attn_weights.unsqueeze(1), memory_bank).squeeze(1)  # (B, D)
 
-            # --- Fuse memory with current EDU
             fused = selective_x[:, l] + mem_ctx.unsqueeze(1)        # (B, L, D)
             x_i = self.main_gate(fused)                 # (B, L, D)
 
-            # print(x_i.shape, speaker_probs.shape)
-            # x_i = (x_i * speaker_probs.unsqueeze(-1).unsqueeze(-1)).mean(dim=1)
-            # print(output.shape, x_i.shape)
             output.append(x_i.unsqueeze(1))
-            # print("update",  l)
             
             scores = torch.tanh(self.pool_W(x_i)) @ self.pool_v
             scores = scores.squeeze(-1)
@@ -1575,12 +1528,14 @@ class MemoryBankDiscourseTransformer(nn.Module):
                 if p_update < self.update_threshold:
                     continue
 
-                idx = torch.argmin(self.memory_usage)
-                self.memory_bank.data[idx] = edu_vec[b].detach()
-                self.memory_keys.data[idx] = q_vec[b].detach()
-                self.memory_usage[idx] = 1.0
+                # for each b in B:
+                idx = torch.argmin(memory_usage[b])
+                memory_bank[b, idx] = edu_vec[b].detach()
+                memory_keys[b, idx] = q_vec[b].detach()
+                memory_usage[b, idx] = 1.0
 
-            self.memory_usage *= 0.98
+
+            memory_usage *= 0.98
                 
         output = torch.concat(output, dim=1)
         # print(output.shape)
