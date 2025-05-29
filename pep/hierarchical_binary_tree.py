@@ -90,8 +90,12 @@ class BinaryTreeAttention(nn.Module): # CE version
             idx_range = list(range(num_chunks))
             current_level = 0
 
-            if label_positions is not None:
-                target_chunk = label_positions[b].item() // self.chunk_size
+            # if label_positions is not None:
+                # target_chunk = label_positions[b].item() // self.chunk_size
+            if label_start is not None and label_end is not None:
+                # For start position, locate chunk
+                target_start_chunk = label_start[b].item() // self.chunk_size
+                target_end_chunk = label_end[b].item() // self.chunk_size
 
             while len(idx_range) > 1 and current_level < self.depth:
                 next_range = []
@@ -137,9 +141,12 @@ class BinaryTreeAttention(nn.Module): # CE version
 
 
 class HierarchicalBinaryTree(nn.Module):
-    def __init__(self, model_name='bert-base-cased', hidden_size=768, chunk_size=64):
+    def __init__(self, tokenizer, model_name='bert-base-cased', hidden_size=768, chunk_size=64):
+        '''
+        tokenizer: after special tokens have been added
+        '''
         super().__init__()
-        self.encoder = LeafEncoder(model_name=model_name)  # frozen BERT embedder
+        self.encoder = LeafEncoder(tokenizer=tokenizer, model_name=model_name)  # frozen BERT embedder
         self.tree_model = BinaryTreeAttention(hidden_size=hidden_size, chunk_size=chunk_size)
 
     def forward(self, input_ids, attention_mask, label_pos, teacher_attn):

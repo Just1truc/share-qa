@@ -6,12 +6,12 @@ from transformers import BertModel, BertTokenizer
 
 class LeafEncoder(nn.Module):
     
-    def __init__(self, model_name='bert-base-uncased'):
+    def __init__(self, tokenizer, model_name='bert-base-uncased'):
         
         super().__init__()
         self.bert = BertModel.from_pretrained(model_name)
-        self.tokenizer = BertTokenizer.from_pretrained(model_name)
-        self.bert.eval()
+        self.bert.resize_token_embeddings(len(self.tokenizer)) # Resize model embeddings to account for new tokens
+        self.bert.eval() # Freeze bert
         for param in self.bert.parameters():
             param.requires_grad = False
             
