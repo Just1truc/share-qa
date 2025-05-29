@@ -10,7 +10,7 @@ class LeafEncoder(nn.Module):
         
         super().__init__()
         self.bert = BertModel.from_pretrained(model_name)
-        self.bert.resize_token_embeddings(len(self.tokenizer)) # Resize model embeddings to account for new tokens
+        self.bert.resize_token_embeddings(len(tokenizer)) # Resize model embeddings to account for new tokens
         self.bert.eval() # Freeze bert
         for param in self.bert.parameters():
             param.requires_grad = False

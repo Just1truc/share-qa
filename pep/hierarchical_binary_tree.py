@@ -60,7 +60,7 @@ class BinaryTreeAttention(nn.Module): # CE version
         if visuals:
             os.makedirs("visuals", exist_ok=True)
 
-    def forward(self, x, query, label_positions=None):
+    def forward(self, x, query, label_start=None, label_end=None):
         B, L, D = x.shape
         assert L % self.chunk_size == 0, "Sequence length must be divisible by chunk size"
         num_chunks = L // self.chunk_size
@@ -93,9 +93,10 @@ class BinaryTreeAttention(nn.Module): # CE version
             # if label_positions is not None:
                 # target_chunk = label_positions[b].item() // self.chunk_size
             if label_start is not None and label_end is not None:
-                # For start position, locate chunk
+                # locate start and end chunks
                 target_start_chunk = label_start[b].item() // self.chunk_size
                 target_end_chunk = label_end[b].item() // self.chunk_size
+                print(target_start_chunk, target_end_chunk)
 
             while len(idx_range) > 1 and current_level < self.depth:
                 next_range = []
@@ -114,10 +115,15 @@ class BinaryTreeAttention(nn.Module): # CE version
                     score_right = torch.dot(q_proj, right)
                     logit = torch.stack([score_left, score_right])
 
-                    if label_positions is not None:
-                        decision = 0 if target_chunk % 2 == 0 else 1
-                        loss = F.cross_entropy(logit.unsqueeze(0), torch.tensor([decision], device=x.device))
-                        target_chunk = target_chunk // 2
+                    # if label_positions is not None:
+                    if label_start is not None and label_end is not None:
+                        if target_start_chunk == target_end_chunk:
+
+
+                        else:
+                        # decision = 0 if target_chunk % 2 == 0 else 1
+                        # loss = F.cross_entropy(logit.unsqueeze(0), torch.tensor([decision], device=x.device))
+                        # target_chunk = target_chunk // 2
                     else:
                         loss = torch.tensor(0.0, device=x.device)
                         decision = torch.argmax(logit).item()
@@ -149,14 +155,14 @@ class HierarchicalBinaryTree(nn.Module):
         self.encoder = LeafEncoder(tokenizer=tokenizer, model_name=model_name)  # frozen BERT embedder
         self.tree_model = BinaryTreeAttention(hidden_size=hidden_size, chunk_size=chunk_size)
 
-    def forward(self, input_ids, attention_mask, label_pos, teacher_attn):
+    def forward(self, input_ids, attention_mask, label_start, label_end, teacher_attn):
         # Step 1: Embed tokens using frozen BERT
         with torch.no_grad():
             # x = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
             x, _ = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         query = x[:, 0, :] # CLS token as query
         # Step 2: Tree-based attention and loss
-        tree_attn, gate_loss = self.tree_model(x, query, label_pos)
+        tree_attn, gate_loss = self.tree_model(x, query, label_start, label_end)
         # Step 3: KL divergence loss (student vs teacher)
         attn_loss = F.kl_div((tree_attn + 1e-8).log(), teacher_attn[:, 0], reduction='batchmean')
         return attn_loss + gate_loss
